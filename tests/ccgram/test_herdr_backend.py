@@ -63,6 +63,16 @@ def expired_discovery_window(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(herdr_module, "_CREATED_SESSION_DISCOVERY_TIMEOUT_SECONDS", 0.0)
 
 
+@pytest.fixture
+def instant_launch_polls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Collapse the launch-verification delay between pane polls.
+
+    Only the wait is removed: every poll still runs, so a test asserting the
+    re-send decision keeps its meaning without waiting out the real interval.
+    """
+    monkeypatch.setattr(herdr_module, "_LAUNCH_FOREGROUND_POLL_SECONDS", 0.0)
+
+
 def _manager(fake: FakeHerdr) -> HerdrManager:
     return HerdrManager(socket_path="/tmp/herdr.sock", runner=fake)
 
@@ -944,6 +954,34 @@ def _created(tab_id: str = "w9:t1", pane_id: str = "w9:p1") -> str:
     )
 
 
+def _pane_process(shell_pid: int, foreground: dict[str, object]) -> str:
+    return _result(
+        process_info={
+            "pane_id": "w9:p1",
+            "shell_pid": shell_pid,
+            "foreground_process_group_id": foreground["pid"],
+            "foreground_processes": [foreground],
+        }
+    )
+
+
+def _bare_shell() -> str:
+    """A pane still sitting at its own shell prompt."""
+    return _pane_process(1000, {"pid": 1000, "argv0": "-zsh", "argv": ["-zsh"]})
+
+
+def _running_command(program: str = "claude") -> str:
+    """A pane whose injected command is the foreground process."""
+    return _pane_process(1000, {"pid": 2000, "argv0": program, "argv": [program]})
+
+
+def _rc_helper() -> str:
+    """A pane running an rc script's own helper, not the injected command."""
+    return _pane_process(
+        1000, {"pid": 2000, "argv0": "git", "argv": ["git", "rev-parse"]}
+    )
+
+
 def _tabs(
     tab_id: str = "w9:t1", workspace_id: str = "selected", label: str = "new"
 ) -> str:
@@ -953,7 +991,7 @@ def _tabs(
 
 
 async def test_create_topic_target_uses_selected_workspace_and_returns_session_target(
-    tmp_path: Path,
+    tmp_path: Path, instant_launch_polls: None
 ) -> None:
     fake = (
         FakeHerdr()
@@ -961,6 +999,7 @@ async def test_create_topic_target_uses_selected_workspace_and_returns_session_t
         .on("tab", "create", out=_created())
         .on("tab", "list", out=_tabs())
         .on("pane", "run", out=_result(type="ok"))
+        .on("pane", "process-info", out=_running_command())
         .on(
             "agent",
             "list",
@@ -991,10 +1030,120 @@ async def test_create_topic_target_uses_selected_workspace_and_returns_session_t
             "selected",
         ],
         ["pane", "run", "w9:p1", "claude --dangerously-skip-permissions"],
+        ["pane", "process-info", "--pane", "w9:p1"],
         ["agent", "list"],
         ["workspace", "list"],
         ["tab", "list"],
     ]
+
+
+async def test_launch_is_re_sent_when_the_shell_rc_eats_the_first_key(
+    tmp_path: Path,
+) -> None:
+    """An rc prompt reading stdin corrupts the launch text, so re-send it.
+
+    oh-my-zsh asks "Would you like to update? [Y/n]" while a tab created in an
+    existing workspace is being typed into, and its one-key read turns ``omp``
+    into the command ``mp``: herdr then reports a pane that is still a shell,
+    publishes no session, and creation fails. Verified against a live herdr
+    0.9.1. The prompt is spent by the key it took, so the second send starts
+    the agent.
+    """
+
+    class RcPromptRunner(FakeHerdr):
+        """Serve a shell that ate the first key and the agent the second one."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.launches = 0
+
+        async def __call__(self, args: Sequence[str]) -> tuple[int, str, str]:
+            rc, out, err = await super().__call__(args)
+            if args[:2] == ["pane", "run"]:
+                self.launches += 1
+            elif args[:2] == ["pane", "process-info"] and self.launches < 2:
+                return 0, _bare_shell(), ""
+            elif args == ["agent", "list"] and self.launches < 2:
+                return 0, _agents(), ""
+            return rc, out, err
+
+    runner = (
+        RcPromptRunner()
+        .on("workspace", "list", out=_workspace("selected", tmp_path))
+        .on("tab", "create", out=_created())
+        .on("tab", "list", out=_tabs())
+        .on("pane", "run", out=_result(type="ok"))
+        .on("pane", "process-info", out=_running_command())
+        .on(
+            "agent",
+            "list",
+            out=_agents(
+                _agent(pane_id="w9:p1", tab_id="w9:t1", workspace_id="selected")
+            ),
+        )
+    )
+    with patch.object(herdr_module, "_LAUNCH_FOREGROUND_POLL_SECONDS", 0.0):
+        target = await _manager(runner).create_topic_target(
+            str(tmp_path), launch_command="claude", workspace_id="selected"
+        )
+
+    assert target.target_id == _target()
+    assert [call for call in runner.calls if call[:2] == ["pane", "run"]] == [
+        ["pane", "run", "w9:p1", "claude"],
+        ["pane", "run", "w9:p1", "claude"],
+    ]
+
+
+async def test_pane_rc_helpers_do_not_read_as_a_successful_launch(
+    tmp_path: Path, instant_launch_polls: None
+) -> None:
+    """A shell's own rc helpers must not pass for the injected command.
+
+    Oh-my-zsh's update check runs ``git`` and ``curl`` in the pane before the
+    launch text arrives. Reading any non-shell foreground process as a started
+    agent would skip the re-send exactly when the text was eaten.
+    """
+    fake = (
+        FakeHerdr()
+        .on("workspace", "list", out=_workspace("selected", tmp_path))
+        .on("tab", "create", out=_created())
+        .on("pane", "run", out=_result(type="ok"))
+        .on("pane", "process-info", out=_rc_helper())
+        .on("agent", "list", out=_agents())
+        .on("tab", "close", out=_result(type="ok"))
+    )
+    with pytest.raises(HerdrError, match="Failed to start"):
+        await _manager(fake).create_topic_target(
+            str(tmp_path), launch_command="claude", workspace_id="selected"
+        )
+
+    assert [call for call in fake.calls if call[:2] == ["pane", "run"]] == [
+        ["pane", "run", "w9:p1", "claude"]
+    ] * herdr_module._LAUNCH_INJECTION_ATTEMPTS
+
+
+async def test_creation_fails_when_the_pane_never_leaves_its_shell(
+    tmp_path: Path, instant_launch_polls: None
+) -> None:
+    """A pane that stays a shell is reported as a failed launch, not a wait."""
+    fake = (
+        FakeHerdr()
+        .on("workspace", "list", out=_workspace("selected", tmp_path))
+        .on("tab", "create", out=_created())
+        .on("pane", "run", out=_result(type="ok"))
+        .on("pane", "process-info", out=_bare_shell())
+        .on("agent", "list", out=_agents())
+        .on("tab", "close", out=_result(type="ok"))
+    )
+    with pytest.raises(HerdrError, match="Failed to start"):
+        await _manager(fake).create_topic_target(
+            str(tmp_path), launch_command="claude", workspace_id="selected"
+        )
+
+    assert [call for call in fake.calls if call[:2] == ["pane", "run"]] == [
+        ["pane", "run", "w9:p1", "claude"]
+    ] * herdr_module._LAUNCH_INJECTION_ATTEMPTS
+    assert ["tab", "close", "w9:t1"] in fake.calls
 
 
 def test_workspace_cwd_prefers_stable_pane_cwd_and_accepts_matching_split_panes() -> (
@@ -1384,6 +1533,7 @@ async def test_native_worktree_returns_session_target_or_fails_unbound(
             out=_tabs("w10:t1", "worktree-ws", "worktree"),
         )
         .on("pane", "run", out=_result(type="ok"))
+        .on("pane", "process-info", out=_running_command())
         .on(
             "agent",
             "list",
@@ -1643,7 +1793,7 @@ async def test_ensure_session_still_rejects_unavailable_server() -> None:
 
 
 async def test_creation_closes_pane_when_agent_never_reports_a_session(
-    tmp_path: Path, expired_discovery_window: None
+    tmp_path: Path, expired_discovery_window: None, instant_launch_polls: None
 ) -> None:
     """A pane without a real session never receives a persistent topic target."""
     fake = (
@@ -1651,6 +1801,7 @@ async def test_creation_closes_pane_when_agent_never_reports_a_session(
         .on("workspace", "list", out=_workspace("selected", tmp_path))
         .on("tab", "create", out=_created())
         .on("pane", "run", out=_result(type="ok"))
+        .on("pane", "process-info", out=_running_command())
         .on("agent", "list", out=_agents())
         .on(
             "pane",

@@ -142,6 +142,16 @@ _CALL_TIMEOUT_SECONDS = 8.0
 _CREATED_SESSION_DISCOVERY_TIMEOUT_SECONDS = 5.0
 _CREATED_SESSION_POLL_INTERVAL_SECONDS = 0.1
 
+# A tab created in an existing workspace hands the launch text to a shell that
+# may still be running rc scripts. An rc script that reads stdin eats the first
+# key: oh-my-zsh asks "Would you like to update? [Y/n]" and its one-key read
+# turns the intended ``omp`` into the command ``mp``, so no agent ever starts.
+# That prompt is spent by the key it took, so re-sending the command reaches a
+# normal prompt. The pane never running the command is what proves it was lost.
+_LAUNCH_INJECTION_ATTEMPTS = 3
+_LAUNCH_FOREGROUND_POLL_SECONDS = 0.25
+_LAUNCH_FOREGROUND_POLLS = 4
+
 # Agent TUIs (Claude Code, Codex, Pi) read a submit key that arrives in the
 # same input batch as the prompt text as a literal newline, so the prompt is
 # typed but never sent. ``pane run`` delivers exactly that batch, so a literal
@@ -1325,6 +1335,64 @@ class HerdrManager:
             target.target_id,
         )
 
+    async def _pane_runs_command(self, pane_id: str, command: str) -> bool:
+        """True when the pane's foreground process is the injected command.
+
+        The launch text is typed into a shell, so the program it names ends up
+        as the pane's foreground process. A pane whose text was eaten keeps its
+        own shell, and the rc scripts' own helpers (git, curl) do not read as a
+        launch either, so a command that never ran is still detectable.
+        """
+        result = await self._call_json(["pane", "process-info", "--pane", pane_id])
+        info = (result or {}).get("process_info")
+        if not isinstance(info, Mapping):
+            return False
+        shell_pid = info.get("shell_pid")
+        processes = info.get("foreground_processes")
+        if not isinstance(processes, list):
+            return False
+        expected = {
+            Path(token.strip("'\"")).name
+            for token in command.split()
+            if token and "=" not in token
+        }
+        for process in processes:
+            if not isinstance(process, Mapping):
+                continue
+            pid = process.get("pid")
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid == shell_pid:
+                continue
+            argv = process.get("argv")
+            candidate = (
+                argv[0] if isinstance(argv, list) and argv else process.get("argv0")
+            )
+            if isinstance(candidate, str) and Path(candidate).name in expected:
+                return True
+        return False
+
+    async def _start_agent_in_pane(self, pane_id: str, command: str) -> bool:
+        """Type *command* into a new pane, re-sending it while it stays a shell.
+
+        Returns False when herdr rejects the command or the pane never runs it,
+        so the caller aborts instead of waiting out the session discovery
+        window for an agent that never started.
+        """
+        for attempt in range(_LAUNCH_INJECTION_ATTEMPTS):
+            if not await self._call_ok(["pane", "run", pane_id, command]):
+                return False
+            for _ in range(_LAUNCH_FOREGROUND_POLLS):
+                await asyncio.sleep(_LAUNCH_FOREGROUND_POLL_SECONDS)
+                if await self._pane_runs_command(pane_id, command):
+                    return True
+            if attempt + 1 < _LAUNCH_INJECTION_ATTEMPTS:
+                logger.warning(
+                    "Herdr pane still shows only its shell; re-sending the launch",
+                    pane_id=pane_id,
+                    command=command,
+                    attempt=attempt + 1,
+                )
+        return False
+
     async def _await_created_session_target(
         self,
         *,
@@ -1423,7 +1491,7 @@ class HerdrManager:
                 raise HerdrError("herdr tab creation returned no root pane")
             if launch_command:
                 command = f"{launch_command} {agent_args}".strip()
-                if not await self._call_ok(["pane", "run", pane_id, command]):
+                if not await self._start_agent_in_pane(pane_id, command):
                     raise HerdrError("Failed to start agent in Herdr tab")
             record = await self._await_created_session_target(
                 tab_id=tab_id,
@@ -1515,8 +1583,8 @@ class HerdrManager:
         workspace_id = created_workspace
 
         try:
-            if launch_command and not await self._call_ok(
-                ["pane", "run", pane_id, launch_command]
+            if launch_command and not await self._start_agent_in_pane(
+                pane_id, launch_command
             ):
                 raise HerdrError("Failed to start agent in Herdr worktree")
             record = await self._await_created_session_target(
