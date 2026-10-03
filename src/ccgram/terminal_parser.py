@@ -28,6 +28,7 @@ class InteractiveUIContent:
 
     content: str  # The extracted display content
     name: str = ""  # Pattern name that matched (e.g. "AskUserQuestion")
+    advisory: bool = False  # structural guess, not a named pattern
 
 
 @dataclass(frozen=True)
@@ -46,6 +47,10 @@ class UIPattern:
     non-blank lines above the top marker.  This lets structural patterns
     (e.g. matching ``❯`` as top) still display the question/description that
     precedes the selection area.
+
+    When ``anchor_last`` is set, the scan for ``top`` starts at the *last*
+    matching line instead of the first, so stale earlier matches in
+    scrollback don't anchor the extraction.
     """
 
     name: str  # Descriptive label (not used programmatically)
@@ -53,7 +58,28 @@ class UIPattern:
     bottom: tuple[re.Pattern[str], ...]
     min_gap: int = 2  # minimum lines between top and bottom (inclusive)
     context_above: int = 0  # extra lines above top marker to include in content
+    anchor_last: bool = False  # start at the last top match, not the first
+    # When True, a numbered-item bottom (no action-hint footer) only
+    # counts near the pane bottom: a real selection cursor sits right
+    # above its footer, while transcript echoes (user messages render
+    # with the same glyph) sit mid-scrollback above unrelated numbered
+    # lists.
+    scrollback_guard: bool = False
+    # Structural guess, not a named pattern: consumers show the keyboard
+    # but must not latch blocking interactive mode.
+    advisory: bool = False
 
+
+# Shared bottoms for the structural selection catch-all: the action-hint
+# footer table is reused by the scrollback guard so the two cannot drift.
+_SELECTION_HINT_BOTTOMS = (
+    re.compile(r"^\s*Esc to (cancel|exit)"),
+    re.compile(r"^\s*Enter to (select|confirm|continue)"),
+    re.compile(r"^\s*ctrl-g to edit"),
+    re.compile(r"(?i)^\s*Press enter to (confirm|select|continue|submit)"),
+    re.compile(r"(?i)^\s*enter to (submit|confirm|select)"),
+)
+_SELECTION_NUMBERED_BOTTOM = re.compile(r"^\s+\d+\.\s")
 
 # ── UI pattern definitions (order matters — first match wins) ────────────
 
@@ -122,18 +148,13 @@ UI_PATTERNS: list[UIPattern] = [
     # cursor.  min_gap=1 for compact prompts.
     UIPattern(
         name="SelectionUI",
-        top=(re.compile(r"^\s*[❯›]\s"),),
-        bottom=(
-            re.compile(r"^\s*Esc to (cancel|exit)"),
-            re.compile(r"^\s*Enter to (select|confirm|continue)"),
-            re.compile(r"^\s*ctrl-g to edit"),
-            re.compile(r"(?i)^\s*Press enter to (confirm|select|continue|submit)"),
-            re.compile(r"(?i)^\s*enter to (submit|confirm|select)"),
-            # Non-selected list items (e.g. /remote-control has no footer)
-            re.compile(r"^\s+\d+\.\s"),
-        ),
+        top=(re.compile(r"^\s*[❯›]\s+\S"),),
+        bottom=(*_SELECTION_HINT_BOTTOMS, _SELECTION_NUMBERED_BOTTOM),
         min_gap=1,
         context_above=10,
+        anchor_last=True,
+        scrollback_guard=True,
+        advisory=True,
     ),
 ]
 
@@ -177,6 +198,42 @@ def _context_start(lines: list[str], top_idx: int, context_above: int) -> int:
     return top_idx
 
 
+# How far a numbered-item bottom may sit from the pane's last non-empty
+# line and still count as a selection footer (scrollback guard).
+_SCROLLBACK_GUARD_DISTANCE = 12
+
+
+def _last_nonempty_from(lines: list[str], top_idx: int) -> int | None:
+    """The last non-empty line after *top_idx* (open-bottom boundary)."""
+    for i in range(len(lines) - 1, top_idx, -1):
+        if lines[i].strip():
+            return i
+    return None
+
+
+def _rejects_scrollback_footer(lines: list[str], bottom_idx: int) -> bool:
+    """A numbered-item bottom with no action-hint footer, far from the
+    pane's last non-empty line, is scrollback (a user-message echo above
+    an unrelated numbered list), not a live selection footer. Consecutive
+    numbered items extend the footer: a live list of any length ends at
+    its own tail, so long real selections are not rejected."""
+    if any(p.search(lines[bottom_idx]) for p in _SELECTION_HINT_BOTTOMS):
+        return False
+    last = bottom_idx
+    for i in range(bottom_idx, len(lines)):
+        line = lines[i]
+        if not line.strip():
+            continue
+        if _SELECTION_NUMBERED_BOTTOM.search(line):
+            last = i
+        else:
+            break
+    tail = _last_nonempty_from(lines, last)
+    if tail is None:
+        return False
+    return tail - last > _SCROLLBACK_GUARD_DISTANCE
+
+
 def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent | None:
     """Try to extract content matching a single UI pattern.
 
@@ -187,7 +244,23 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
     top_idx: int | None = None
     bottom_idx: int | None = None
 
-    for i, line in enumerate(lines):
+    # Codex and Claude both reuse the same cursor glyph (❯/›) for old chat
+    # prompts and the active selected option. Anchor on the final cursor,
+    # not transcript history.
+    start = (
+        max(
+            (
+                i
+                for i, line in enumerate(lines)
+                if any(p.search(line) for p in pattern.top)
+            ),
+            default=0,
+        )
+        if pattern.anchor_last
+        else 0
+    )
+    for i in range(start, len(lines)):
+        line = lines[i]
         if top_idx is None:
             if any(p.search(line) for p in pattern.top):
                 top_idx = i
@@ -198,19 +271,22 @@ def _try_extract(lines: list[str], pattern: UIPattern) -> InteractiveUIContent |
     if top_idx is None:
         return None
 
-    # No bottom patterns → use last non-empty line as boundary
     if not pattern.bottom:
-        for i in range(len(lines) - 1, top_idx, -1):
-            if lines[i].strip():
-                bottom_idx = i
-                break
+        bottom_idx = _last_nonempty_from(lines, top_idx)
 
     if bottom_idx is None or bottom_idx - top_idx < pattern.min_gap:
         return None
 
+    if pattern.scrollback_guard and _rejects_scrollback_footer(lines, bottom_idx):
+        return None
+
     display_start = _context_start(lines, top_idx, pattern.context_above)
     content = "\n".join(lines[display_start : bottom_idx + 1]).rstrip()
-    return InteractiveUIContent(content=_shorten_separators(content), name=pattern.name)
+    return InteractiveUIContent(
+        content=_shorten_separators(content),
+        name=pattern.name,
+        advisory=pattern.advisory,
+    )
 
 
 # ── Bottom-up fallback ───────────────────────────────────────────────────
@@ -521,20 +597,44 @@ def _collect_status_progress_lines(
     return progress_lines
 
 
+# Claude Code right-aligns footer notices ("✔ Update installed · Restart to
+# update") above the separator; the spinner line starts at column 0. The
+# threshold is low so narrow panes still count; known spinners never do.
+_FOOTER_NOTICE_MIN_INDENT = 4
+
+
+def _is_footer_notice(line: str) -> bool:
+    stripped = line.lstrip()
+    if not stripped or len(line) - len(stripped) < _FOOTER_NOTICE_MIN_INDENT:
+        return False
+    first = stripped[0]
+    return first not in STATUS_SPINNERS and not (
+        _BRAILLE_START <= ord(first) <= _BRAILLE_END
+    )
+
+
 def _find_status_line_index(lines: list[str], scan_start: int) -> int | None:
-    """Locate the Claude spinner status line above the footer separators."""
+    """Locate the Claude spinner status line above the footer separators.
+
+    Checks the two lines above each separator. Right-aligned footer notices
+    are skipped without using up that window.
+    """
     for i in range(len(lines) - 1, scan_start - 1, -1):
         if not _is_separator(lines[i]):
             continue
-        for offset in (1, 2):
-            j = i - offset
-            if j < scan_start:
-                break
-            candidate = lines[j].strip()
+        j = i - 1
+        remaining = 2
+        while remaining and j >= scan_start:
+            line = lines[j]
+            j -= 1
+            if _is_footer_notice(line):
+                continue
+            remaining -= 1
+            candidate = line.strip()
             if not candidate:
                 continue
             if is_likely_spinner(candidate[0]):
-                return j
+                return j + 1
             break
     return None
 

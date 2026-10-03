@@ -17,6 +17,7 @@ from ...config import config
 from ...telegram_client import TelegramClient
 from ...utils import log_throttle_sweep
 from ..live.live_view import tick_live_views
+from .delivery_watch import check_delivery_wedges
 from ..topics.topic_deletion import cleanup_retired_topics
 from ..topics.topic_provisioning_recovery import recover_topic_provisioning
 from ..topics.topic_lifecycle import (
@@ -56,8 +57,23 @@ async def run_periodic_tasks(
         await prune_stale_state(all_windows)
         if not recovery.get("rate_limited"):
             await probe_topic_existence(client)
-            await cleanup_retired_topics(client)
+            # The drain retries failed deletions from ANY retire path
+            # (explicit unbind --delete, failed provisioning, system
+            # replacement), not only dead-session retention. With the
+            # knob off it still skips records the AUTOMATIC dead-session
+            # path left behind (reason dead_session): the operator
+            # turned that deletion off, and those topics stay.
+            await cleanup_retired_topics(
+                client,
+                exclude_reasons=(
+                    None
+                    if config.autodelete_dead_topics
+                    else frozenset({"dead_session"})
+                ),
+            )
         log_throttle_sweep()
+        # Last in the block so a raise here cannot skip the peers.
+        await check_delivery_wedges(client)
 
 
 async def run_lifecycle_tasks(

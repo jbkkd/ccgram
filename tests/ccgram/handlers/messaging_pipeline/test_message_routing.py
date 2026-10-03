@@ -23,6 +23,7 @@ def _make_msg(
     role: str = "assistant",
     is_complete: bool = True,
     session_id: str = "sess-1",
+    provider_name: str = "",
 ) -> NewMessage:
     return NewMessage(
         session_id=session_id,
@@ -33,6 +34,7 @@ def _make_msg(
         tool_use_id=tool_use_id,
         role=role,
         is_complete=is_complete,
+        provider_name=provider_name,
     )
 
 
@@ -65,7 +67,7 @@ def mock_deps():
             new_callable=AsyncMock,
         ) as eq,
         patch(
-            "ccgram.handlers.messaging_pipeline.message_routing.get_message_queue"
+            "ccgram.handlers.messaging_pipeline.message_routing.get_or_create_queue"
         ) as gmq,
         patch(
             "ccgram.handlers.messaging_pipeline.message_routing.handle_interactive_ui",
@@ -95,7 +97,7 @@ def mock_deps():
     ):
         sq.find_users_for_session.return_value = [(100, "@5", 42, -100)]
         sq.resolve_session_for_window = AsyncMock(return_value=None)
-        gmq.return_value = None
+        gmq.return_value = asyncio.Queue()
         yield {
             "sq": sq,
             "eq": eq,
@@ -110,10 +112,31 @@ def mock_deps():
         }
 
 
-async def test_no_active_users_returns_early(bot, mock_deps):
+async def test_no_active_users_non_deliverable_returns_early(bot, mock_deps):
     mock_deps["sq"].find_users_for_session.return_value = []
-    await handle_new_message(_make_msg(), bot)
+    await handle_new_message(_make_msg(content_type="thinking"), bot)
     mock_deps["eq"].assert_not_called()
+
+
+async def test_unroutable_complete_message_drops_without_enqueue(
+    bot, mock_deps, monkeypatch
+):
+    """A complete unroutable message warns and enqueues nothing."""
+    mock_deps["sq"].find_users_for_session.return_value = []
+    warned: list[tuple] = []
+    monkeypatch.setattr(
+        message_routing.logger,
+        "warning",
+        lambda msg, **kw: warned.append((msg, kw)),
+    )
+    await handle_new_message(_make_msg(text="lost reply", session_id="sess-9"), bot)
+    mock_deps["eq"].assert_not_called()
+    assert warned == [
+        (
+            "Complete assistant message has no routed topic; dropped",
+            {"session_id": "sess-9", "text_len": len("lost reply")},
+        )
+    ]
 
 
 async def test_short_thinking_is_dropped(bot, mock_deps):
@@ -142,6 +165,34 @@ async def test_interactive_tool_use_handled_skips_enqueue(bot, mock_deps):
     mock_deps["eq"].assert_not_called()
 
 
+async def test_interactive_dispatch_survives_never_draining_queue(bot, mock_deps):
+    # A per-user queue whose item never completes must not freeze the
+    # sequential monitor dispatch on queue.join().
+    queue: asyncio.Queue = asyncio.Queue()
+    queue.put_nowait(object())  # never task_done -> join() blocks forever
+    mock_deps["gmq"].return_value = queue
+    mock_deps["hui"].return_value = True
+    with patch.object(
+        message_routing,
+        "_INTERACTIVE_QUEUE_JOIN_TIMEOUT_S",
+        0.05,
+    ):
+        await asyncio.wait_for(
+            handle_new_message(
+                _make_msg(
+                    text="?",
+                    content_type="tool_use",
+                    tool_name="AskUserQuestion",
+                    tool_use_id="t1",
+                ),
+                bot,
+            ),
+            timeout=2.0,
+        )
+    mock_deps["hui"].assert_called_once()
+    mock_deps["eq"].assert_not_called()
+
+
 async def test_interactive_tool_use_unhandled_falls_through(bot, mock_deps):
     mock_deps["hui"].return_value = False
     await handle_new_message(
@@ -165,13 +216,16 @@ async def test_pending_interactive_msg_is_cleared(bot, mock_deps):
 
 
 async def test_complete_message_enqueues_content(bot, mock_deps):
-    await handle_new_message(_make_msg(text="done", is_complete=True), bot)
+    await handle_new_message(
+        _make_msg(text="done", is_complete=True, provider_name="pi"), bot
+    )
     mock_deps["eq"].assert_called_once()
     kwargs = mock_deps["eq"].call_args.kwargs
     assert kwargs["user_id"] == 100
     assert kwargs["window_id"] == "@5"
     assert kwargs["thread_id"] == 42
     assert kwargs["chat_id"] == -100
+    assert kwargs["source_provider_name"] == "pi"
 
 
 async def test_incomplete_assistant_text_updates_and_finalizes_draft(bot, mock_deps):

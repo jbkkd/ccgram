@@ -287,11 +287,15 @@ async def _check_interactive_only(
     status = await _resolve_status(window_id, pane_text, w, runtime=runtime)
 
     if status is not None and status.is_interactive:
-        set_interactive_mode(user_id, window_id, thread_id)
+        # Advisory detections never pre-latch blocking mode: the latch
+        # decision belongs to handle_interactive_ui (named pattern or
+        # transcript tool_use only).
+        if not status.ui_advisory:
+            set_interactive_mode(user_id, window_id, thread_id)
         handled = await handle_interactive_ui(
             PTBTelegramClient(bot), user_id, window_id, thread_id
         )
-        if not handled:
+        if not handled and not status.ui_advisory:
             clear_interactive_mode(user_id, thread_id)
 
 
@@ -344,6 +348,7 @@ async def _handle_dead_window_notification(
     # paths both call this for the same window and could otherwise both pass the
     # guard above before either marks, sending two notifications.
     lc.mark_dead_notified(user_id, thread_id, wid)
+    retained = False
     try:
         chat_ids = _exact_dead_topic_chat_ids(user_id, thread_id, wid)
         if chat_ids is None:
@@ -356,6 +361,20 @@ async def _handle_dead_window_notification(
         agent_status_cache.clear(wid)
         ps.clear_seen_status(wid)
         clear_tool_msg_ids_for_topic(user_id, thread_id)
+        if not config.autodelete_dead_topics:
+            logger.info(
+                "dead_session_topic_retained",
+                user_id=user_id,
+                thread_id=thread_id,
+                window_id=wid,
+            )
+            # Keep the marker sticky ONLY for this confirmed-dead retain:
+            # the retained binding keeps this topic in the tick set, and a
+            # cleared marker would re-run the presence probe and this log
+            # line every poll cycle. Not-dead exits below clear it, so a
+            # live or unverifiable window keeps its retry semantics.
+            retained = True
+            return
         for chat_id in chat_ids:
             if is_pending_creation(wid):
                 break
@@ -365,7 +384,8 @@ async def _handle_dead_window_notification(
             if outcome == "rate_limited":
                 break
     finally:
-        lc.clear_dead_notification(user_id, thread_id)
+        if not retained:
+            lc.clear_dead_notification(user_id, thread_id)
 
 
 def _exact_dead_topic_chat_ids(
@@ -416,6 +436,7 @@ async def _delete_dead_topic_immediately(
         router=thread_router,
         chat_id=chat_id,
         before_delete=clear_state_before_delete,
+        retirement_reason="dead_session",
     )
     logger.info(
         "dead_session_topic_cleanup",
@@ -596,6 +617,7 @@ async def _update_status(
         if status is not None and status.is_interactive:
             return
         await clear_interactive_msg(user_id, client, thread_id)
+        clear_interactive_mode(user_id, thread_id)
         should_check_new_ui = False
     elif interactive_window is not None:
         await clear_interactive_msg(user_id, client, thread_id)

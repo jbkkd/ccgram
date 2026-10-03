@@ -33,6 +33,7 @@ from ccgram.hooks.adapters import (
 from ccgram.hooks.model import HookAdapter, NormalizedHookEvent, ProviderName
 from ccgram.multiplexer import get_multiplexer
 from ccgram.multiplexer import herdr_socket
+from ccgram.multiplexer.agterm_panes import hook_pane
 from ccgram.multiplexer.self_identify import resolve_self_identity
 
 logger = structlog.get_logger()
@@ -903,6 +904,29 @@ def _resolve_window_id(pane_id: str) -> tuple[str, str, str, str] | None:
     return session_window_key, window_id, window_name, pane_tty
 
 
+def _ccgram_tmux_session_name() -> str:
+    """Return ``TMUX_SESSION_NAME`` as the bot resolves it, without ``Config``.
+
+    ``Config`` loads the cwd ``.env`` first, and the hook's cwd is the agent's
+    project: an empty ``TELEGRAM_BOT_TOKEN=`` there made it raise and kill the
+    hook (#252). Read only the exported env and ``$CCGRAM_DIR/.env``.
+    """
+    # Lazy: utils brings in subprocess + structlog at import time; dotenv is
+    # only needed when the name is not exported.
+    from .utils import ccgram_dir, tmux_session_name
+
+    if "TMUX_SESSION_NAME" not in os.environ:
+        env_file = ccgram_dir() / ".env"
+        if env_file.is_file():
+            # Lazy: see above.
+            from dotenv import dotenv_values
+
+            value = dotenv_values(env_file).get("TMUX_SESSION_NAME")
+            if value:
+                return value
+    return tmux_session_name()
+
+
 def _session_map_session_for(window_id: str, pane_session: str) -> str:
     """Return the tmux session ``session_map`` should be keyed under.
 
@@ -916,11 +940,7 @@ def _session_map_session_for(window_id: str, pane_session: str) -> str:
     Falls back to the pane's own session whenever the window is not linked into
     ccgram's session, which is the single-session case and today's behaviour.
     """
-    # Lazy: config reads the environment at import time; the hook path should
-    # not pay that cost, nor fail, when the window cannot be resolved at all.
-    from .config import config
-
-    target = getattr(config, "tmux_session_name", "")
+    target = _ccgram_tmux_session_name()
     if not target or target == pane_session:
         return pane_session
     try:
@@ -1290,8 +1310,10 @@ def _refresh_session_map_if_stale(
     window_name: str,
     payload_cwd: str,
     payload_transcript_path: str,
+    *,
+    recover_missing: bool = False,
 ) -> None:
-    """Refresh stale entries and recover a dropped Pi ``SessionStart``.
+    """Refresh stale entries and recover a dropped or newly pane-qualified start.
 
     A stale Herdr snapshot can make the one-shot Pi SessionStart unsafe to
     bind. A later matching Pi hook may therefore create the missing entry once
@@ -1299,7 +1321,7 @@ def _refresh_session_map_if_stale(
     reserve offset zero before consuming the marker.
     """
     existing = _read_session_map_entry(session_window_key)
-    if not existing and provider_name != "pi":
+    if not existing and provider_name != "pi" and not recover_missing:
         return
     cwd = payload_cwd or existing.get("cwd", "")
     transcript_path = _resolve_transcript_path(
@@ -1316,10 +1338,13 @@ def _refresh_session_map_if_stale(
         )
     ):
         return
-    replay_from_start = provider_name == "pi" and (
-        not existing
-        or existing.get("session_id") != session_id
-        or not existing.get("transcript_path")
+    replay_from_start = (recover_missing and not existing) or (
+        provider_name == "pi"
+        and (
+            not existing
+            or existing.get("session_id") != session_id
+            or not existing.get("transcript_path")
+        )
     )
     # Split only the backend prefix; Herdr target IDs may contain colons.
     tmux_session_name = session_window_key.split(":", 1)[0]
@@ -1335,7 +1360,8 @@ def _refresh_session_map_if_stale(
     )
     if not existing:
         logger.info(
-            "Recovered Pi session_map from later hook for %s: %s",
+            "Recovered %s session_map from later hook for %s: %s",
+            provider_name,
             session_window_key,
             session_id[:8],
         )
@@ -1350,14 +1376,62 @@ def _refresh_session_map_if_stale(
     )
 
 
+_PROVIDER_NAME_ORDER: tuple[ProviderName, ...] = ("gemini", "codex", "claude")
+
+# Runtimes that commonly wrap a provider CLI (npm-installed packages run as
+# ``node .../codex.js``), and flags whose value is not a script path.
+_PROVIDER_RUNTIMES = frozenset(
+    {"node", "nodejs", "bun", "deno", "python", "python3", "npx", "bunx"}
+)
+_RUNTIME_CODE_FLAGS = frozenset(
+    {"-e", "--eval", "-c", "--command", "-p", "--print", "-m", "--module"}
+)
+_RUNTIME_VALUE_FLAGS = frozenset(
+    {"-r", "--require", "--import", "--loader", "--experimental-loader"}
+)
+
+
+def _runtime_script_argument(tokens: list[str]) -> str | None:
+    """The script path an interpreter wraps, or None for flags and code strings."""
+    skip_next = False
+    for token in tokens[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in _RUNTIME_CODE_FLAGS:
+            return None
+        if token in _RUNTIME_VALUE_FLAGS:
+            skip_next = True
+            continue
+        if token.startswith("-"):
+            continue
+        return token
+    return None
+
+
+def _path_names_provider(path: str, provider: str) -> bool:
+    """Whether a script path's segments name one provider package."""
+    for segment in path.replace("\\", "/").casefold().split("/"):
+        if (
+            segment == provider
+            or segment.startswith(f"{provider}-")
+            or segment.startswith(f"{provider}.")
+        ):
+            return True
+    return False
+
+
 def _provider_from_pane_tty(pane_tty: str) -> ProviderName | None:
     """Best-effort provider detection from foreground tty process commands.
 
     This is a last-resort fallback; the primary paths are the explicit
     ``provider_name`` field and the ``/.provider/`` transcript path prefix
-    checked in ``detect_provider_from_payload``.  JS-wrapped Pi (e.g.
-    ``node ~/.pi/agent/cli.js``) is not matched here — it is caught by the
-    ``/.pi/`` transcript path check instead.
+    checked in ``detect_provider_from_payload``.  Only the executable
+    basename and, for interpreter wrappers, the script argument count as
+    evidence: a helper's data path or an ``-e`` code string must never name
+    the provider (a claude-mem helper carrying ``~/.codex`` used to beat the
+    running claude).  JS-wrapped Pi (e.g. ``node ~/.pi/agent/cli.js``) is
+    not matched here — it is caught by the ``/.pi/`` transcript path check.
     """
     if not pane_tty:
         return None
@@ -1371,16 +1445,75 @@ def _provider_from_pane_tty(pane_tty: str) -> ProviderName | None:
         )
     except subprocess.TimeoutExpired, OSError:
         return None
-    text = result.stdout.lower()
-    if "gemini" in text:
-        return "gemini"
-    if "codex" in text:
-        return "codex"
-    if "claude" in text:
-        return "claude"
-    if any(tok == "pi" or tok.endswith("/pi") for tok in text.split()):
+    executables: set[str] = set()
+    scripts: list[str] = []
+    for line in result.stdout.splitlines():
+        try:
+            tokens = shlex.split(line)
+        except ValueError:
+            # ``ps -o command=`` joins argv without quoting, so an argument
+            # with an unmatched quote (``codex what's failing``) makes shlex
+            # raise; the executable is still worth recording.
+            tokens = line.split()
+        if not tokens:
+            continue
+        executable = os.path.basename(tokens[0]).casefold()
+        executables.add(executable)
+        if executable in _PROVIDER_RUNTIMES:
+            script = _runtime_script_argument(tokens)
+            if script is not None:
+                scripts.append(script)
+    for provider in _PROVIDER_NAME_ORDER:
+        if provider in executables or any(
+            _path_names_provider(script, provider) for script in scripts
+        ):
+            return provider
+    if "pi" in executables:
         return "pi"
     return None
+
+
+def _agterm_hook_target(
+    agterm_session: str, provider_name: str, agent_session_id: str
+) -> tuple[str, str] | None:
+    """Resolve the hook's agent against one live agterm window snapshot."""
+    if os.environ.get("AGTERM_PANE", "left") not in {"left", "right"}:
+        return None
+    args = ["agtermctl", "tree", "--json"]
+    for env_key, option in (
+        ("AGTERM_SOCKET", "--socket"),
+        ("AGTERM_WINDOW_ID", "--window"),
+    ):
+        if value := os.environ.get(env_key):
+            args.extend([option, value])
+    try:
+        result = subprocess.run(
+            args, capture_output=True, text=True, timeout=3, check=False
+        )
+        payload = json.loads(result.stdout)
+        if result.returncode or not payload.get("ok"):
+            return None
+        tree = payload["result"]["tree"]
+        sessions = [
+            session
+            for workspace in tree["workspaces"]
+            for session in workspace.get("sessions", [])
+            if str(session.get("id", "")).casefold() == agterm_session.casefold()
+        ]
+        if len(sessions) != 1:
+            return None
+        pane = hook_pane(sessions[0], provider_name, agent_session_id)
+        return (str(pane["id"]), str(pane.get("name") or "")) if pane else None
+    except (
+        OSError,
+        subprocess.TimeoutExpired,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+    ):
+        logger.debug("Could not resolve agterm hook pane", exc_info=True)
+        return None
 
 
 def _locate_primary_window(
@@ -1402,7 +1535,8 @@ def _locate_primary_window(
     panes resolve through ``_resolve_window_id`` (``display-message``), herdr
     panes resolve their exact workspace/pane locator to a session target, so
     the session_map key becomes ``herdr:<opaque-target-id>``, and an agterm
-    session is its own identity, keyed ``agterm:<session-uuid>``.
+    primary retains ``agterm:<session-uuid>`` while split peers resolve to their
+    own guarded target from the live argv snapshot.
     """
     identity = resolve_self_identity(
         os.environ,
@@ -1411,6 +1545,11 @@ def _locate_primary_window(
             herdr_target_id
             if use_herdr_snapshot
             else _resolve_herdr_target_id(workspace_id, pane_id, provider_name)
+        ),
+        agterm_query=(
+            lambda agterm_session: _agterm_hook_target(
+                agterm_session, provider_name, session_id
+            )
         ),
     )
     if identity is None:
@@ -1549,7 +1688,11 @@ def _hook_adapter_for_context(
     provider_name: str,
     herdr_provider: ProviderName | None,
 ) -> HookAdapter | None:
-    """Return an adapter only when the live Herdr identity matches this hook."""
+    """Return an adapter only for a primary agent matching the live identity."""
+    # Background Pi children inherit the parent's multiplexer identity.
+    if os.environ.get("PI_SUBAGENT_CHILD") == "1":
+        logger.debug("Ignoring hook from background Pi subagent")
+        return None
     if herdr_provider is not None and herdr_provider != provider_name:
         logger.info(
             "Skipping %s hook from nested agent in Herdr pane; live agent is %s",
@@ -1642,6 +1785,16 @@ def _process_hook_stdin(
         use_herdr_snapshot,
         herdr_snapshot_unavailable,
     ) = _herdr_hook_context(payload, detected_provider)
+    if (
+        detected_provider is None
+        and not payload.get("transcript_path")
+        and (
+            os.environ.get("PI_CODING_AGENT") == "true"
+            or os.environ.get("PI_HOOK_TIMEOUT_SEC")
+        )
+    ):
+        # The hook-runner sets PI_HOOK_TIMEOUT_SEC, not the bash-only PI_CODING_AGENT.
+        detected_provider = "pi"
     if detected_provider is None:
         identity = resolve_self_identity(os.environ, tmux_query=_resolve_window_id)
         if identity:
@@ -1723,6 +1876,7 @@ def _process_hook_stdin(
             if normalized.transcript_path
             else herdr_transcript_path
         ),
+        recover_missing=session_window_key.startswith("agterm:"),
     )
     _write_event(event, normalized.session_id, session_window_key, normalized.data)
     return normalized
@@ -1753,29 +1907,22 @@ def hook_main(
     install: bool = False,
     uninstall: bool = False,
     status: bool = False,
-    provider_name: str = "claude",
+    provider_name: str | None = None,
 ) -> None:
-    """Process a Claude Code hook event from stdin, or manage hook installation."""
+    """Process an agent hook event from stdin, or manage hook installation."""
     _configure_hook_logging()
 
     if install:
         logger.info("Hook install requested")
-        sys.exit(_install_hook(provider_name))
+        sys.exit(_install_hook(provider_name or "claude"))
 
     if uninstall:
-        sys.exit(_uninstall_hook(provider_name))
+        sys.exit(_uninstall_hook(provider_name or "claude"))
 
     if status:
-        sys.exit(_hook_status(provider_name))
+        sys.exit(_hook_status(provider_name or "claude"))
 
-    # Pass None for the implicit Claude default so detect_provider_from_payload
-    # gets first say (an explicit `--provider claude` invocation deliberately
-    # keeps the explicit flag to surface the mismatch warning when payload
-    # heuristics disagree). The CLI default also resolves to "claude", so the
-    # None path covers the common case of an unannotated hook command.
-    normalized = _process_hook_stdin(
-        provider_name if provider_name != "claude" else None
-    )
+    normalized = _process_hook_stdin(provider_name)
     if (
         normalized
         and normalized.provider_name == "codex"

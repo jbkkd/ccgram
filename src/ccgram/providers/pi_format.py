@@ -44,6 +44,7 @@ _TOOL_NAME_ALIASES: dict[str, str] = {
     "web_fetch": "WebFetch",
     "websearch": "WebSearch",
     "web_search": "WebSearch",
+    "ask_user_question": "AskUserQuestion",
     # omp's question tool. The canonical name routes the tool_use into
     # ccgram's interactive-UI handling and gives it the question emoji.
     "ask": "AskUserQuestion",

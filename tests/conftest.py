@@ -33,6 +33,20 @@ for _key in list(os.environ):
 os.environ["TELEGRAM_BOT_TOKEN"] = "test:0000000000:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 os.environ["ALLOWED_USERS"] = "12345"
 os.environ["CCGRAM_DIR"] = tempfile.mkdtemp(prefix="ccgram-test-")
+# Pin to tmux so tests are hermetic: auto-detect would pick the ambient
+# terminal (agterm/herdr/tmux) and change config.multiplexer_name, which
+# breaks every test that uses "ccgram:@0" session-map key format.
+os.environ["CCGRAM_MULTIPLEXER"] = "tmux"
+
+
+@pytest.fixture(autouse=True)
+def _clean_pi_hook_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep hooks independent of the Pi process launching pytest."""
+    monkeypatch.delenv("PI_CODING_AGENT", raising=False)
+    monkeypatch.delenv("PI_HOOK_TIMEOUT_SEC", raising=False)
+    monkeypatch.delenv("PI_SUBAGENT_CHILD", raising=False)
+    monkeypatch.delenv("AGTERM_PANE", raising=False)
+    monkeypatch.delenv("AGTERM_PANE_ID", raising=False)
 
 
 @pytest.fixture(autouse=True)

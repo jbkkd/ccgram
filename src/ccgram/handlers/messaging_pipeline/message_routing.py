@@ -26,16 +26,47 @@ from ..interactive import (
 )
 from ..response_builder import build_response_parts
 from ..telegram_origin import consume_telegram_injection
-from .message_queue import enqueue_content_message, get_message_queue
+from .message_queue import enqueue_content_message, get_or_create_queue
 
 logger = structlog.get_logger()
 
 _MIN_THINKING_LENGTH = 20
 
+# This handler runs inline in the monitor's sequential dispatch, so an
+# unbounded queue.join() here freezes delivery for every session. Queue
+# counts cannot distinguish a send backing off from a wedged one (a single
+# queued item can retry for up to the 300s flood-control budget in
+# message_queue.py), so time is the only honest bound. Past this timeout we
+# accept a possible reorder of the interactive UI relative to queued
+# content, rather than stall monitor dispatch for every other session.
+_INTERACTIVE_QUEUE_JOIN_TIMEOUT_S = 90.0
+
 # One draft per session/topic. Provider updates are cumulative snapshots, not deltas.
 _DRAFT_TTL_SECONDS = 25.0
 _active_drafts: dict[tuple[int, str, int | None, int], DraftStream] = {}
 _draft_expiry_tasks: dict[tuple[int, str, int | None, int], asyncio.Task[None]] = {}
+
+
+def _handle_unroutable_message(msg: NewMessage) -> None:
+    """Warn about a complete message that found no routed topic.
+
+    The window-session link can lag reality right after a restart or an
+    adoption: a bound, tracked session can resolve empty, and complete
+    assistant messages were dropped with only a DEBUG line (invisible in
+    the journal). The warning makes the class visible; non-deliverable
+    content stays at DEBUG.
+    """
+    deliverable = (
+        msg.is_complete and msg.role == "assistant" and msg.content_type == "text"
+    )
+    if not deliverable:
+        logger.debug("No active users for session %s", msg.session_id)
+        return
+    logger.warning(
+        "Complete assistant message has no routed topic; dropped",
+        session_id=msg.session_id,
+        text_len=len(msg.text),
+    )
 
 
 async def _update_window_offset(user_id: int, window_id: str) -> None:
@@ -163,7 +194,7 @@ async def handle_new_message(msg: NewMessage, client: TelegramClient) -> None:  
     active_users = session_query.find_users_for_session(msg.session_id)
 
     if not active_users:
-        logger.debug("No active users for session %s", msg.session_id)
+        _handle_unroutable_message(msg)
         return
 
     for user_id, window_id, thread_id, chat_id in active_users:
@@ -189,9 +220,19 @@ async def handle_new_message(msg: NewMessage, client: TelegramClient) -> None:  
 
         if msg.tool_name in INTERACTIVE_TOOL_NAMES and msg.content_type == "tool_use":
             set_interactive_mode(user_id, window_id, thread_id, chat_id=chat_id)
-            queue = get_message_queue(user_id)
-            if queue:
-                await queue.join()
+            # get_or_create_queue also creates the worker if missing. The
+            # worker catches every exception and always calls task_done, so
+            # in practice it only exits via cancellation (e.g. shutdown).
+            queue = get_or_create_queue(client, user_id)
+            try:
+                await asyncio.wait_for(queue.join(), _INTERACTIVE_QUEUE_JOIN_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Delivery queue still draining before interactive UI; "
+                    "proceeding so the monitor keeps dispatching",
+                    user_id=user_id,
+                    window_id=window_id,
+                )
             await asyncio.sleep(0.3)
             handled = await handle_interactive_ui(
                 client, user_id, window_id, thread_id, chat_id=chat_id
@@ -234,6 +275,7 @@ async def handle_new_message(msg: NewMessage, client: TelegramClient) -> None:  
                 thread_id=thread_id,
                 chat_id=chat_id,
                 source_session_id=msg.session_id,
+                source_provider_name=msg.provider_name or None,
             )
 
             await _update_window_offset(user_id, window_id)

@@ -3,8 +3,9 @@
 import asyncio
 import json
 import os
+import time
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 import structlog
@@ -158,6 +159,52 @@ class TestMonitorLoop:
             await monitor._monitor_loop()
 
         assert contexts == [{}, {}]
+
+    async def test_map_snapshot_is_refreshed_after_awaited_hook_callback(
+        self, monitor: SessionMonitor
+    ) -> None:
+        window_id = HERDR_TARGETS["a"]
+        stale = {window_id: {"session_id": "old-agent"}}
+        current = {window_id: {"session_id": "shell-session"}}
+        contents = stale
+        loaded: list[dict | None] = []
+
+        async def read_map():
+            return dict(contents)
+
+        async def process_hooks():
+            nonlocal contents
+            contents = current
+
+        async def load_map(raw=None):
+            loaded.append(raw)
+
+        async def stop_after_cycle(_delay: float) -> None:
+            monitor._running = False
+
+        with (
+            patch.object(monitor, "_cleanup_all_stale_sessions", AsyncMock()),
+            patch.object(
+                monitor, "_load_current_session_map", AsyncMock(return_value={})
+            ),
+            patch.object(
+                monitor, "_detect_and_cleanup_changes", AsyncMock(return_value=current)
+            ),
+            patch.object(monitor, "check_for_updates", AsyncMock(return_value=[])),
+            patch("ccgram.session_monitor.read_session_map_raw", read_map),
+            patch.object(monitor, "_read_hook_events", process_hooks),
+            patch("ccgram.session_map.session_map_sync") as sync,
+            patch(
+                "ccgram.session_monitor.list_windows_for_reconciliation",
+                AsyncMock(return_value=None),
+            ),
+            patch("ccgram.session_monitor.asyncio.sleep", stop_after_cycle),
+        ):
+            sync.load_session_map = load_map
+            monitor._running = True
+            await monitor._monitor_loop()
+
+        assert loaded == [current]
 
     async def test_reliable_listing_monitors_only_live_windows(
         self, monitor: SessionMonitor
@@ -557,6 +604,114 @@ class TestSettledPrefixWatermarkCommit:
 
         assert self._offset(monitor, "s1") == 0
         assert monitor._delivery_receipts["s1"] == [ready]
+
+    def test_aged_skip_barrier_force_completes(self, monitor: SessionMonitor) -> None:
+        # An undeliverable notice must not pause the source forever.
+        self._track(monitor, "s1", [self._ready(100)])
+        self._begin_skip(monitor)
+        intent = monitor.state.pending_skips["s1"]
+        intent.created_at = time.time() - 10_000.0
+        intent.purge_complete = True
+
+        with patch.object(monitor, "_skip_is_current", return_value=True):
+            monitor._expire_aged_skip_barriers()
+
+        assert self._offset(monitor, "s1") == 500
+        assert "s1" not in monitor.state.pending_skips
+        assert "s1" not in monitor._skip_notice_receipts
+
+    def test_aged_skip_barrier_on_rebound_topic_cancels(
+        self, monitor: SessionMonitor
+    ) -> None:
+        # A rebound topic never advances the old watermark; the range
+        # stays replayable under the new binding.
+        self._track(monitor, "s1", [self._ready(100)])
+        self._begin_skip(monitor)
+        intent = monitor.state.pending_skips["s1"]
+        intent.created_at = time.time() - 10_000.0
+        intent.purge_complete = True
+
+        with patch.object(monitor, "_skip_is_current", return_value=False):
+            monitor._expire_aged_skip_barriers()
+
+        assert self._offset(monitor, "s1") == 0
+        assert "s1" not in monitor.state.pending_skips
+
+    def test_aged_barrier_with_incomplete_purge_replays(
+        self, monitor: SessionMonitor
+    ) -> None:
+        # A barrier whose queued range was never retired must not skip
+        # those bytes silently: cancel so they replay.
+        self._track(monitor, "s1", [self._ready(100)])
+        self._begin_skip(monitor)
+        intent = monitor.state.pending_skips["s1"]
+        intent.created_at = time.time() - 10_000.0
+        assert intent.purge_complete is False
+
+        with patch.object(monitor, "_skip_is_current", return_value=True):
+            monitor._expire_aged_skip_barriers()
+
+        assert self._offset(monitor, "s1") == 0
+        assert "s1" not in monitor.state.pending_skips
+
+    def test_aged_barrier_survives_validator_failure(
+        self, monitor: SessionMonitor
+    ) -> None:
+        # A validator exception is not a rebind: decide nothing this pass.
+        # Exercised through the real set_skip_callbacks wiring so the
+        # exception path runs through the actual registered validator,
+        # not a patched private helper.
+        self._track(monitor, "s1", [self._ready(100)])
+        self._begin_skip(monitor)
+        intent = monitor.state.pending_skips["s1"]
+        intent.created_at = time.time() - 10_000.0
+        intent.purge_complete = True
+
+        validate = Mock(side_effect=RuntimeError("boom"))
+        monitor.set_skip_callbacks(
+            purge=AsyncMock(), notice=AsyncMock(), validate=validate
+        )
+
+        monitor._expire_aged_skip_barriers()
+
+        validate.assert_called_once_with(intent)
+        assert self._offset(monitor, "s1") == 0
+        assert "s1" in monitor.state.pending_skips
+
+    def test_aged_barrier_deadline_read_from_config_at_call_time(
+        self, monitor: SessionMonitor, monkeypatch
+    ) -> None:
+        # The deadline must be read live, not frozen into a module constant
+        # at import time, so tests (and runtime config reloads) can patch it.
+        self._track(monitor, "s1", [self._ready(100)])
+        self._begin_skip(monitor)
+        intent = monitor.state.pending_skips["s1"]
+        intent.created_at = time.time() - 120.0
+        intent.purge_complete = True
+        monitor.set_skip_callbacks(
+            purge=AsyncMock(), notice=AsyncMock(), validate=lambda _intent: True
+        )
+        monkeypatch.setattr(
+            "ccgram.session_monitor.config.skip_barrier_deadline_s", 60.0
+        )
+
+        monitor._expire_aged_skip_barriers()
+
+        assert self._offset(monitor, "s1") == 500
+        assert "s1" not in monitor.state.pending_skips
+
+    def test_legacy_barrier_without_stamp_gets_clock_started(
+        self, monitor: SessionMonitor
+    ) -> None:
+        # Barriers persisted before the stamp are aged from first sight,
+        # not force-completed on the first cycle.
+        self._begin_skip(monitor)
+        assert monitor.state.pending_skips["s1"].created_at == 0.0
+
+        monitor._expire_aged_skip_barriers()
+
+        assert monitor.state.pending_skips["s1"].created_at > 0.0
+        assert "s1" in monitor.state.pending_skips
 
     def test_delivered_skip_wins_and_discards_ordinary_receipts(
         self, monitor: SessionMonitor

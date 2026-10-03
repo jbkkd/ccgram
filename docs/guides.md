@@ -237,12 +237,15 @@ All settings accept both CLI flags and environment variables. CLI flags take pre
 | `CCGRAM_PROMPT_MODE` / `--prompt-mode`                | `wrap`                         | Shell prompt marker: `wrap` (append `⌘N⌘`) or `replace` (legacy `{prefix}:N❯`)                       |
 | `CCGRAM_PROMPT_MARKER`                                | `ccgram`                       | Marker prefix used only by `replace` mode                                                            |
 | `CCGRAM_PANE_LIFECYCLE_NOTIFY`                        | `false`                        | Default for per-window pane create/close notifications (toggle via `/panes`)                         |
+| `CCGRAM_AUTODELETE_DEAD_TOPICS`                       | `true`                         | Set `false` to keep a dead session's topic and binding instead of deleting it                        |
 | `CCGRAM_SHOW_HIDDEN_DIRS` / `--show-hidden-dirs`      | `false`                        | Show dot-directories in the directory browser                                                        |
 | `CCGRAM_SEND_SEARCH_DEPTH`                            | `5`                            | Max directory depth for `/send` file search                                                          |
 | `CCGRAM_SEND_MAX_RESULTS`                             | `50`                           | Max file results returned by `/send` search                                                          |
 | `CCGRAM_TOOLBAR_CONFIG`                               | `~/.ccgram/toolbar.toml`       | Path to custom toolbar TOML; falls back to built-in defaults if missing                              |
 | `CCGRAM_STATUS_POLL_INTERVAL`                         | `1.0`                          | Status polling interval in seconds (min 0.5)                                                         |
 | `CCGRAM_YOLO_CONFIRMATION_TIMEOUT`                    | `30.0`                         | Seconds to wait for the YOLO confirmation prompt (min 1.0)                                           |
+| `CCGRAM_SKIP_BARRIER_DEADLINE_S`                      | `600`                          | Seconds a pending backlog-skip barrier waits for its notice before force-completion (min 60)         |
+| `CCGRAM_DELIVERY_WATCH_GAP_KB`                        | `256`                          | KB of undelivered transcript output before the delivery-wedge watch alerts; `0` disables it          |
 | `CCGRAM_MINIAPP_BASE_URL`                             | _(disabled)_                   | Externally reachable HTTPS URL for the Mini App dashboard                                            |
 | `CCGRAM_MINIAPP_HOST`                                 | `127.0.0.1`                    | Local bind host for the Mini App aiohttp server                                                      |
 | `CCGRAM_MINIAPP_PORT`                                 | `8765`                         | Local bind port for the Mini App aiohttp server                                                      |
@@ -436,6 +439,8 @@ Creating sessions from the terminal on herdr is covered in [Creating Sessions fr
 
 Before each removal, CCGram rechecks the exact chat/topic binding. A topic that is active or was rebound in the meantime is protected from deletion. A new binding for the same chat/topic also removes the old retired record. If the multiplexer cannot provide an authoritative listing, `/sync` performs no cleanup.
 
+`CCGRAM_AUTODELETE_DEAD_TOPICS=false` only gates the automatic per-tick dead-session deletion. A topic kept that way is still a binding pointing at a confirmed-dead window, so it surfaces as a `ghost_binding` audit issue; `/sync` (run directly or via its **Fix** button) closes and deletes it like any other ghost topic, regardless of the knob.
+
 Session creation also owns an exact topic record, saved before the first remote request. That ownership protects the topic throughout slow startup and replacement; it does not expire while the creation task is running. Startup, periodic cleanup, and `/sync` recover abandoned creation records from current session presence and verify the recorded Telegram topic before restoring its binding. If that topic was deleted while its target remains alive, recovery creates a fresh topic without replacing another current binding for the target. Failed recreation attempts with a known outcome remain queued across restarts and respect Telegram rate limits.
 
 A confirmed absent target can have its known topic cleaned up. An unknown target or an uncertain creation result without a new topic ID remains protected and appears as creation awaiting confirmation; CCGram does not guess whether the remote creation succeeded or repeat an ambiguous request. Targets belonging to a different backend are unverified, never treated as absent by the selected backend.
@@ -545,18 +550,18 @@ The buttons shown adapt to each provider's capabilities. Claude and Antigravity 
 
 ## Manual Provider Override (`/agent`)
 
-`/agent` (alias `/provider`) fixes a mis-tagged window. Auto-detection (`detect_provider_from_command` + JS-runtime foreground-process fallback via the multiplexer seam) returns empty for custom wrappers like `ralphex`, so the window can keep its prior provider tag — SessionMonitor then polls a stale transcript, `/last` returns old text, and tool calls/replies stop showing up.
+`/agent` (alias `/provider`) shows the topic name, provider, and Auto/Manual mode. A manual choice is accepted only when the recognized live foreground process matches that provider; unknown or mismatched processes leave routing unchanged. `/agent` does not start, stop, or redirect a process in the terminal.
 
 Forms:
 
 ```text
-/agent              # show picker (current marked ✓, with (manual override) badge if set)
-/agent shell        # switch to shell
-/agent claude       # switch to Claude (also: codex, gemini, pi, omp)
+/agent              # show picker (current marked ✓, with Auto/Manual mode)
+/agent shell        # select Terminal only when a shell is running in the pane
+/agent claude       # select Claude only when Claude is running (also: codex, gemini, pi, omp)
 /agent auto         # clear manual override and re-run auto-detection
 ```
 
-On switch, the bot clears `WindowState.transcript_path`, drops the previous `session_map.json` entry (so SessionMonitor stops reading the wrong transcript), and for shell triggers prompt-marker setup via `shell_prompt_orchestrator.ensure_setup`. The next `SessionStart` hook from the new provider repopulates `session_map`.
+A manual selection first checks that the live foreground matches the provider. It then reconciles the session-map entry against that destination: a matching entry is retained, a mismatched entry is dropped, and subsequent hooks from other providers are filtered. `/agent auto` checks and cleans the entry again before releasing the pin; if storage cannot be confirmed, it remains pinned. Old queued transcript content from another provider is discarded. Prompt-marker setup is offered only by backends that declare support; agterm does not because a shell builtin can be mistaken for a prompt.
 
 Manual overrides set `WindowState.provider_manual_override=True`. The periodic auto-detection in `_detect_and_apply_provider` skips overridden windows until `/agent auto` clears the flag.
 
@@ -730,6 +735,10 @@ ccgram retries brief Telegram polling conflicts for up to 90 seconds, which can
 occur after a network reconnect. Persistent conflicts stop with a non-zero exit
 so `Restart=on-failure` restarts the service. Check for another bot process that
 uses the same token if the conflict returns.
+
+A graceful shutdown that wedges (for example a stuck update queue) is
+exit-forced after 600 seconds with the stop's own exit code, so
+`Restart=on-failure` cannot be blocked forever by a half-stopped process.
 
 On macOS, you can use a launchd plist or simply run in a detached tmux session:
 

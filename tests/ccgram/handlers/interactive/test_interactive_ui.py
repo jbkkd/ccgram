@@ -25,10 +25,12 @@ from ccgram.handlers.interactive.interactive_ui import (
     _build_interactive_keyboard,
     _interactive_mode,
     _interactive_msgs,
+    _interactive_panes,
     _lookup_pane_name,
     _send_cooldowns,
     clear_interactive_mode,
     format_interactive_message,
+    get_interactive_pane,
     get_interactive_window,
     handle_interactive_ui,
     INTERACTIVE_INSTRUCTION_LINE,
@@ -47,7 +49,7 @@ def _interactive_env(bot: AsyncMock):
         patch(
             f"{_UI}._capture_interactive_content",
             new_callable=AsyncMock,
-            return_value=("AskUserQuestion", "Pick one:"),
+            return_value=("AskUserQuestion", "Pick one:", False),
         ),
         patch(f"{_UI}.thread_router") as mock_router,
         patch(f"{_UI}.rate_limit_send", new_callable=AsyncMock),
@@ -171,6 +173,7 @@ class TestInteractiveModeTracking:
     @pytest.fixture(autouse=True)
     def _clear_interactive_mode(self) -> None:
         _interactive_mode.clear()
+        _interactive_panes.clear()
 
     def test_set_and_get(self) -> None:
         set_interactive_mode(100, "@0", thread_id=42, chat_id=-999)
@@ -184,6 +187,21 @@ class TestInteractiveModeTracking:
     def test_none_thread_uses_zero(self) -> None:
         set_interactive_mode(100, "@0", thread_id=None, chat_id=-999)
         assert get_interactive_window(100, None, chat_id=-999) == "@0"
+
+    def test_window_level_prompt_is_not_replaced_by_a_sibling(self) -> None:
+        set_interactive_mode(100, "@0", thread_id=42, chat_id=-999)
+        set_interactive_mode(100, "@0", thread_id=42, chat_id=-999, pane_id="%2")
+        assert get_interactive_pane(100, 42, chat_id=-999) is None
+
+    def test_window_level_prompt_replaces_a_sibling_owner(self) -> None:
+        set_interactive_mode(100, "@0", thread_id=42, chat_id=-999, pane_id="%2")
+        set_interactive_mode(100, "@0", thread_id=42, chat_id=-999)
+        assert get_interactive_pane(100, 42, chat_id=-999) is None
+
+    def test_later_sibling_replaces_an_earlier_sibling(self) -> None:
+        set_interactive_mode(100, "@0", thread_id=42, chat_id=-999, pane_id="%2")
+        set_interactive_mode(100, "@0", thread_id=42, chat_id=-999, pane_id="%3")
+        assert get_interactive_pane(100, 42, chat_id=-999) == "%3"
 
 
 @pytest.fixture

@@ -5,6 +5,7 @@ import pytest
 if TYPE_CHECKING:
     from ccgram.screen_buffer import ScreenBuffer
 
+from ccgram.providers.codex import CodexProvider
 from ccgram.terminal_parser import (
     extract_bash_output,
     extract_interactive_content,
@@ -170,6 +171,41 @@ class TestParseStatusLine:
             "   ⎇ main  ✱ Opus 4.6\n"
         )
         assert parse_status_line(pane) == "Working hard"
+
+    _UPDATE_NOTICE = " " * 40 + "✔ Update installed · Restart to update"
+
+    def test_skips_right_aligned_update_notice(self):
+        """Regression #255: the footer notice must not win over the spinner."""
+        pane = (
+            "output\n"
+            "✽ Discombobulating… (16s · ↓ 151 tokens · still thinking)\n"
+            f"{self._UPDATE_NOTICE}\n"
+            f"{_SEPARATOR}\n"
+            "❯\n"
+            f"{_SEPARATOR}\n"
+            "  ⬆ /gsd-update │ Fable 5.1 │ playground\n"
+        )
+        assert (
+            parse_status_line(pane)
+            == "Discombobulating… (16s · ↓ 151 tokens · still thinking)"
+        )
+
+    def test_idle_update_notice_is_not_status(self):
+        pane = f"output\n{self._UPDATE_NOTICE}\n{_SEPARATOR}\n❯\n{_SEPARATOR}\n"
+        assert parse_status_line(pane) is None
+
+    def test_skips_update_notice_on_narrow_pane(self):
+        pane = (
+            "output\n"
+            "✻ Reading file\n"
+            "      ✔ Update installed · Restart to update\n"
+            f"{_SEPARATOR}\n"
+        )
+        assert parse_status_line(pane) == "Reading file"
+
+    def test_indented_known_spinner_is_still_status(self):
+        pane = f"output\n      ⠋ Loading modules\n{_SEPARATOR}\n"
+        assert parse_status_line(pane) == "Loading modules"
 
     def test_uses_fixture(self, sample_pane_status_line: str):
         assert parse_status_line(sample_pane_status_line) == "Reading file src/main.py"
@@ -439,6 +475,114 @@ class TestExtractInteractiveContent:
     def test_min_gap_too_small_returns_none(self):
         pane = "  Do you want to proceed?\n  Esc to cancel\n"
         assert extract_interactive_content(pane) is None
+
+
+class TestSelectionUIAnchorLast:
+    """SelectionUI (the ❯/› structural catch-all) anchors on the last top
+    match, not the first, so stale earlier matches in scrollback don't
+    anchor the extraction (UIPattern.anchor_last).
+    """
+
+    @pytest.mark.parametrize("selected", [1, 2])
+    def test_codex_approval_retains_both_choices_after_prior_chat_prompts(
+        self, selected: int
+    ):
+        lines = [
+            "› Earlier user request",
+            "• Earlier response",
+            "",
+            "› Inspect the counter",
+            "• Calling approval_probe.inspect_probe({})",
+            "",
+            "  Field 1/1",
+            '  Allow the approval_probe MCP server to run tool "inspect_probe"?',
+            ("  › " if selected == 1 else "    ")
+            + "1. Allow   Run the tool and continue.",
+            ("  › " if selected == 2 else "    ") + "2. Cancel  Cancel this tool call",
+            "",
+            "  enter to submit | esc to cancel",
+        ]
+        status = CodexProvider().parse_terminal_status("\n".join(lines))
+        assert status is not None and status.is_interactive
+        assert "1. Allow" in status.raw_text
+        assert "2. Cancel" in status.raw_text
+        assert f"› {selected}." in status.raw_text
+
+    @pytest.mark.parametrize("selected", [1, 2])
+    def test_claude_approval_retains_both_choices_after_prior_chat_prompts(
+        self, selected: int
+    ):
+        """Same case as Codex's, but with Claude's ❯ cursor glyph — the
+        catch-all pattern matches both, so this affects Claude too.
+        """
+        lines = [
+            "❯ Earlier user request",
+            "• Earlier response",
+            "",
+            "❯ Inspect the counter",
+            "• Calling approval_probe.inspect_probe({})",
+            "",
+            "  Field 1/1",
+            '  Allow the approval_probe MCP server to run tool "inspect_probe"?',
+            ("  ❯ " if selected == 1 else "    ")
+            + "1. Allow   Run the tool and continue.",
+            ("  ❯ " if selected == 2 else "    ") + "2. Cancel  Cancel this tool call",
+            "",
+            "  enter to submit | esc to cancel",
+        ]
+        result = extract_interactive_content("\n".join(lines))
+        assert result is not None
+        assert result.name == "SelectionUI"
+        assert "1. Allow" in result.content
+        assert "2. Cancel" in result.content
+        assert f"❯ {selected}." in result.content
+
+    def test_fresh_menu_extracted_after_stale_menu_far_in_scrollback(self):
+        """A stale menu (with its own footer) followed, well past the
+        context_above window, by a fresh menu: only the fresh one comes
+        back.
+        """
+        lines = [
+            "❯ 1. Old option A",
+            "  2. Old option B",
+            "",
+            "  Enter to select · Esc to cancel",
+            *(f"  unrelated output line {i}" for i in range(15)),
+            "",
+            "  Fresh question here",
+            "❯ 1. New option A",
+            "  2. New option B",
+            "",
+            "  Enter to select · Esc to cancel",
+        ]
+        result = extract_interactive_content("\n".join(lines))
+        assert result is not None
+        assert result.name == "SelectionUI"
+        assert "New option A" in result.content
+        assert "New option B" in result.content
+        assert "Old option" not in result.content
+
+    def test_menu_without_footer_before_composer_line_returns_none(self):
+        """Documents current (surprising) behavior: a composer prompt line
+        with typed text (``› echo hi``) matches the same top pattern as the
+        menu cursor, so anchor_last locks onto the composer line instead of
+        the menu above it. With no bottom match after the composer line,
+        extraction returns None — even though a valid unselected-item menu
+        is visible just above it. Not fixed here; flagged as a known gap.
+
+        (A bare composer line with only trailing whitespace does *not*
+        reproduce this: ``str.strip()`` on the whole pane text removes that
+        trailing whitespace, so the composer line no longer matches the top
+        pattern and the menu above is extracted correctly instead.)
+        """
+        lines = [
+            "  Pick one:",
+            "❯ 1. Option A",
+            "  2. Option B",
+            "",
+            "› echo hi",
+        ]
+        assert extract_interactive_content("\n".join(lines)) is None
 
 
 class TestExtractInteractiveContentBoolean:
@@ -1000,3 +1144,62 @@ class TestDetectRemoteControl:
         from ccgram.terminal_parser import detect_remote_control
 
         assert detect_remote_control([]) is False
+
+
+class TestScrollbackGuard:
+    """A user-message echo above an unrelated numbered list is not a
+    selection (2026-10-01 anti-vocale incident: the echo glyph renders
+    like a selection cursor and the agent's numbered reply matched the
+    footer, latching a false prompt that rejected all text)."""
+
+    def test_echo_above_numbered_list_in_scrollback_is_rejected(self):
+        filler = [f"  transcript line {i}" for i in range(20)]
+        pane = (
+            ["  ⏺ Bash(git fetch origin)"]
+            + ["  done"]
+            + ["❯ Ricordami cosa ti serve da me"]
+            + [""]
+            + [
+                "  1. Una nota vocale WhatsApp (30 secondi).",
+                "  2. Uno sguardo alla console Firebase.",
+            ]
+            + filler
+            + ["❯", "  ⏵⏵ auto mode on"]
+        )
+        assert extract_interactive_content(pane) is None
+
+    def test_near_bottom_numbered_selection_still_matches(self):
+        pane = [
+            "Remote Control",
+            "",
+            "   Remote Control lets you access this CLI session.",
+            "",
+            "   ❯ 1. Enable Remote Control for this session",
+            "     2. Never mind",
+        ]
+        result = extract_interactive_content(pane)
+        assert result is not None and result.name == "SelectionUI"
+
+    def test_action_hint_footer_matches_from_any_distance(self):
+        pane = (
+            [
+                "❯ Option A",
+                "  1. whatever",
+            ]
+            + [f"  more scrollback {i}" for i in range(20)]
+            + [
+                "  Esc to cancel",
+            ]
+        )
+        result = extract_interactive_content(pane)
+        assert result is not None
+
+
+class TestScrollbackGuardLongList:
+    def test_long_live_selection_list_is_not_rejected(self):
+        """A genuine selection whose numbered options continue well past
+        12 lines is a live list, not scrollback (review finding)."""
+        options = [f"  {i}. Option {i}" for i in range(1, 20)]
+        pane = ["Pick a task:"] + ["❯ " + options[0][2:]] + options[1:]
+        result = extract_interactive_content(pane)
+        assert result is not None and result.name == "SelectionUI"

@@ -8,6 +8,7 @@ The module-level `config` instance is imported by nearly every other module.
 Key class: Config (singleton instantiated as `config`).
 """
 
+import math
 import structlog
 import os
 from pathlib import Path
@@ -45,10 +46,40 @@ def _resolve_toolbar_path() -> str:
     return str(fallback) if fallback.exists() else ""
 
 
+def _skip_barrier_deadline_s() -> float:
+    """Backlog-skip barrier aging, floored so no value expires barriers
+    near-instantly and tolerant of empty, non-numeric, or non-finite
+    input (inf would disable expiry outright)."""
+    try:
+        value = float(os.getenv("CCGRAM_SKIP_BARRIER_DEADLINE_S") or 600.0)
+    except ValueError:
+        return 600.0
+    if not math.isfinite(value):
+        return 600.0
+    return max(60.0, value)
+
+
+def _delivery_watch_gap_bytes() -> int:
+    """Delivery-wedge gap threshold in bytes, floored at 0 (disable) and
+    tolerant of empty or non-numeric input so a bad env value cannot break
+    startup."""
+    try:
+        value = float(os.getenv("CCGRAM_DELIVERY_WATCH_GAP_KB") or 256.0)
+    except ValueError:
+        return 256 * 1024
+    if not math.isfinite(value):
+        return 256 * 1024
+    try:
+        return max(0, int(value * 1024))
+    except OverflowError, ValueError:
+        # Finite but too large for an int; treat like any other bad value.
+        return 256 * 1024
+
+
 class Config:
     """Application configuration loaded from environment variables."""
 
-    def __init__(self) -> None:
+    def __init__(self) -> None:  # noqa: PLR0915
         self.config_dir = ccgram_dir()
         self.config_dir.mkdir(parents=True, exist_ok=True)
 
@@ -103,6 +134,8 @@ class Config:
             max(0.5, float(os.getenv("CCGRAM_STATUS_POLL_INTERVAL", "1.0"))),
             max(1.0, float(os.getenv("CCGRAM_YOLO_CONFIRMATION_TIMEOUT", "30.0"))),
         )
+        self.skip_barrier_deadline_s = _skip_barrier_deadline_s()
+        self.delivery_watch_gap_bytes = _delivery_watch_gap_bytes()
 
         # Multi-instance support
         group_id_str = os.getenv("CCGRAM_GROUP_ID")
@@ -123,6 +156,15 @@ class Config:
         self.show_hidden_dirs: bool = os.getenv(
             "CCGRAM_SHOW_HIDDEN_DIRS", ""
         ).lower() in ("1", "true", "yes")
+
+        # Dead-session topic retention. Topics are the session list. Deleting a
+        # dead session's topic also destroys the binding a later reconciliation
+        # could fold onto a re-keyed successor digest, so operators may keep
+        # dead topics and close them by hand (the recovery banner still
+        # answers the next message there). Default true = delete, as before.
+        self.autodelete_dead_topics: bool = os.getenv(
+            "CCGRAM_AUTODELETE_DEAD_TOPICS", "true"
+        ).strip().lower() not in ("0", "false", "no", "off")
 
         # Ack reaction: react to forwarded messages with an emoji (empty = disabled)
         self.ack_reaction: str = os.getenv("CCGRAM_ACK_REACTION", "")
@@ -202,9 +244,25 @@ class Config:
         )
 
     def _init_multiplexer(self) -> None:
-        """Select the terminal-multiplexer backend."""
-        # tmux default; herdr and agterm opt-in.
-        self.multiplexer_name: str = os.getenv("CCGRAM_MULTIPLEXER", "tmux")
+        """Select the terminal-multiplexer backend.
+
+        ``CCGRAM_MULTIPLEXER`` accepts a concrete backend name (``tmux``,
+        ``herdr``, ``agterm``) or the special value ``auto`` (the default).
+        In auto mode the backend is detected from environment variables:
+        ``HERDR_PANE_ID`` → herdr, ``TMUX_PANE`` → tmux,
+        ``AGTERM_SESSION_ID`` → agterm; falls back to ``tmux`` when none match.
+        """
+        raw = os.getenv("CCGRAM_MULTIPLEXER", "auto")
+        if raw == "auto":
+            # Lazy: avoid pulling in multiplexer.registry (and libtmux) at
+            # config import time; detect_multiplexer_name is pure env-var logic.
+            from ccgram.multiplexer.registry import (
+                detect_multiplexer_name,
+            )  # Lazy: env-only, no I/O
+
+            self.multiplexer_name: str = detect_multiplexer_name(dict(os.environ))
+        else:
+            self.multiplexer_name: str = raw
 
     def _init_live_view(self) -> None:
         self.live_view_interval: int = max(
