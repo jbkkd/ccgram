@@ -48,3 +48,30 @@ def test_shell_has_no_picker_commands() -> None:
     """Shell forwards raw commands; no TUI picker can fire there."""
     shell = registry.get("shell")
     assert shell.capabilities.tui_picker_commands == frozenset()
+
+
+@pytest.mark.parametrize("provider", _PROVIDERS, ids=lambda p: p.capabilities.name)
+def test_screen_commands_subset_of_builtin_commands(provider) -> None:
+    caps = provider.capabilities
+    builtin = {c.lstrip("/") for c in caps.builtin_commands}
+    missing = caps.tui_screen_commands - builtin
+    assert not missing, f"{caps.name} screen commands not in builtin set: {missing}"
+
+
+@pytest.mark.parametrize("provider", _PROVIDERS, ids=lambda p: p.capabilities.name)
+def test_screen_commands_are_bare_lowercase_names(provider) -> None:
+    caps = provider.capabilities
+    bad = {c for c in caps.tui_screen_commands if c.startswith("/") or c != c.lower()}
+    assert not bad, (
+        f"{caps.name} tui_screen_commands must be bare lowercase names; found: {bad}"
+    )
+
+
+@pytest.mark.parametrize("provider", _PROVIDERS, ids=lambda p: p.capabilities.name)
+def test_screen_commands_disjoint_from_picker_commands(provider) -> None:
+    """A command drives either the picker hint or the screen image, never both."""
+    caps = provider.capabilities
+    overlap = caps.tui_screen_commands & caps.tui_picker_commands
+    assert not overlap, (
+        f"{caps.name} declares {overlap} as both a picker and a terminal screen"
+    )

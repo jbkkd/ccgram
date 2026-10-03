@@ -74,6 +74,7 @@ class TestForwardCommandResolution:
                 supports_incremental_read=True,
                 supports_status_snapshot=False,
                 tui_picker_commands=frozenset(),
+                tui_screen_commands=frozenset(),
                 # Claude has no follow-up keybinding: /followup is forwarded as
                 # an ordinary command rather than queued.
                 followup_key="",
@@ -384,6 +385,7 @@ class TestForwardCommandResolution:
                 supports_incremental_read=True,
                 supports_status_snapshot=True,
                 tui_picker_commands=frozenset(),
+                tui_screen_commands=frozenset(),
                 followup_key="",
             ),
             build_status_snapshot=MagicMock(return_value="Status snapshot body"),
@@ -419,6 +421,7 @@ class TestForwardCommandResolution:
                 supports_incremental_read=True,
                 supports_status_snapshot=False,
                 tui_picker_commands=frozenset(),
+                tui_screen_commands=frozenset(),
                 followup_key="",
             ),
             build_status_snapshot=MagicMock(return_value=None),
@@ -458,6 +461,7 @@ class TestForwardCommandResolution:
                 supports_incremental_read=True,
                 supports_status_snapshot=True,
                 tui_picker_commands=frozenset(),
+                tui_screen_commands=frozenset(),
                 followup_key="",
             ),
             build_status_snapshot=MagicMock(return_value=None),
@@ -580,9 +584,16 @@ class TestForwardWithRealProvider:
                 f"{_FW}._capture_command_probe_context",
                 AsyncMock(return_value=(None, None, None)),
             ),
-            patch(f"{_FW}._spawn_command_failure_probe", MagicMock()),
+            patch(
+                f"{_FW}._spawn_command_failure_probe", MagicMock()
+            ) as self.mock_failure_probe,
+            patch(
+                f"{_FW}._spawn_screen_snapshot", MagicMock()
+            ) as self.mock_screen_spawn,
             patch(f"{_FW}.sync_scoped_provider_menu", new_callable=AsyncMock),
-            patch(f"{_FW}._maybe_send_status_snapshot", new_callable=AsyncMock),
+            patch(
+                f"{_FW}._maybe_send_status_snapshot", new_callable=AsyncMock
+            ) as self.mock_status_snapshot,
             patch("ccgram.handlers.status.rc_probe.arm_rc_probe"),
         ):
             yield
@@ -730,3 +741,52 @@ class TestForwardWithRealProvider:
         reply_text = update.message.reply_text.call_args[0][0]
         assert "drive the picker" not in reply_text
         assert "/toolbar" not in reply_text
+
+    async def test_tui_screen_command_replies_with_terminal_image(self) -> None:
+        """Oh My Pi draws /context in the TUI only — answer with the screen."""
+        self._mock_get_provider.return_value = _real_provider("omp")
+        update = _make_update(text="/context")
+        await forward_command_handler(update, _make_context())
+
+        self.mock_screen_spawn.assert_called_once()
+        assert self.mock_screen_spawn.call_args.args[1:] == (
+            update.message,
+            "@1",
+            "project",
+            "/context",
+        )
+        self.mock_failure_probe.assert_not_called()
+        self.mock_status_snapshot.assert_not_called()
+
+    async def test_tui_screen_command_wins_over_status_snapshot(self) -> None:
+        """omp's /stats opens a dashboard screen, not a transcript reply."""
+        self._mock_get_provider.return_value = _real_provider("omp")
+        update = _make_update(text="/stats")
+        await forward_command_handler(update, _make_context())
+
+        self.mock_screen_spawn.assert_called_once()
+        assert self.mock_screen_spawn.call_args.args[1:] == (
+            update.message,
+            "@1",
+            "project",
+            "/stats",
+        )
+        self.mock_status_snapshot.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("provider_name", "command"),
+        [
+            ("claude", "/context"),
+            ("omp", "/compact"),
+            ("omp", "/changelog"),
+            ("pi", "/model"),
+        ],
+    )
+    async def test_relayed_commands_never_send_a_screen_image(
+        self, provider_name: str, command: str
+    ) -> None:
+        self._mock_get_provider.return_value = _real_provider(provider_name)
+        update = _make_update(text=command)
+        await forward_command_handler(update, _make_context())
+
+        self.mock_screen_spawn.assert_not_called()

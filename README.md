@@ -89,9 +89,11 @@ Topics remain protected while their sessions are being created, including slow s
 **Install:**
 
 ```bash
-uv tool install ccgram          # recommended
+uv tool install ccgram          # upstream release (alexei-led/ccgram)
 # or: pipx install ccgram | brew install alexei-led/tap/ccgram
 ```
+
+These commands install the published upstream package. This repository is the `jbkkd/ccgram` fork and carries unreleased changes, so installing it from a checkout is a different command — see [Installing this fork](#installing-this-fork).
 
 **Telegram setup:**
 
@@ -140,6 +142,39 @@ agterm is macOS-native. Install [agterm](https://github.com/umputun/agterm), the
 
 Set `CCGRAM_MULTIPLEXER=agterm`. CCGram adopts sessions from the `ccgram` workspace by default; set `CCGRAM_AGTERM_WORKSPACES` to a comma-separated list of workspace names, or `*` for all workspaces. Run `ccgram doctor` to verify the CLI and control socket.
 
+---
+
+## Installing This Fork
+
+This repository is the `jbkkd/ccgram` fork. It carries changes that are not in the published package, so install it from a checkout. `uv tool install ccgram` and the Homebrew tap install upstream `alexei-led/ccgram` instead.
+
+```bash
+git clone git@github.com:jbkkd/ccgram.git ~/Code/ccgram    # first time only
+cd ~/Code/ccgram
+git switch feat/omp-provider                              # the branch you want
+git pull
+uv tool install --force --no-cache .
+```
+
+**Always pass `--no-cache`.** A plain `uv tool install --force .` reuses uv's cached build of that checkout path: the installed copy stays on an older revision and the bot keeps answering with the old behavior. The cache also ignores uncommitted edits, and `ccgram --version` moves only when commits change, so a stale install looks healthy.
+
+**Restart the bot** after installing. A running process keeps the code it loaded: stop it with `Ctrl-C` in its pane, then start it again with `ccgram`.
+
+**Verify that the install matches the checkout:**
+
+```bash
+ccgram --version
+diff -rq src/ccgram "$(uv tool dir)"/ccgram/lib/python3*/site-packages/ccgram --exclude=__pycache__
+```
+
+`diff` prints nothing when the installed package is the checkout. Check a single file the same way when only one module changed:
+
+```bash
+cmp src/ccgram/providers/omp.py "$(uv tool dir)"/ccgram/lib/python3*/site-packages/ccgram/providers/omp.py
+```
+
+Updating this fork is the same command: `git pull`, then the `--no-cache` install, then the restart.
+
 ## Platform Support
 
 CCGram supports Linux, macOS, and WSL2. Native Windows is not supported. The agterm backend is macOS-native.
@@ -167,7 +202,7 @@ Native Windows does not provide the Unix file locking, signal handling, and term
 ## Development
 
 ```bash
-git clone https://github.com/alexei-led/ccgram.git && cd ccgram
+git clone git@github.com:jbkkd/ccgram.git && cd ccgram
 uv sync --extra dev
 make check         # lint, format, typecheck, test
 make test-e2e      # end-to-end tests (requires agent CLIs; see docs/guides.md#e2e-tests)

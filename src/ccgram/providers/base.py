@@ -156,6 +156,12 @@ class ProviderCapabilities:
     # pointing at /toolbar so users know how to drive the picker from
     # Telegram. Empty for providers without modal pickers.
     tui_picker_commands: frozenset[str] = frozenset()
+    # Slash command names (without the leading "/") that draw a full-screen
+    # in-TUI view and write nothing to the transcript — Oh My Pi's /context,
+    # /usage, /tools. Forwarding one leaves the reply pipeline nothing to
+    # relay, so the send path answers with a captured terminal image instead
+    # of silence. Empty for providers that relay every command natively.
+    tui_screen_commands: frozenset[str] = frozenset()
     # tmux key name that submits the text as a queued follow-up while the
     # agent is streaming. Empty means the provider has no follow-up contract.
     followup_key: str = ""

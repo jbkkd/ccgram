@@ -20,9 +20,9 @@ Change monitor/event dispatch:
 
 Change provider behavior (commands, parsing, capabilities):
 
-- `src/ccgram/providers/base.py` for contract + capabilities (including `tui_picker_commands`).
+- `src/ccgram/providers/base.py` for contract + capabilities (including `tui_picker_commands` and `tui_screen_commands`).
 - `src/ccgram/providers/__init__.py` for per-window resolution.
-- `src/ccgram/providers/{claude,codex,gemini,pi,shell}.py` for provider behavior.
+- `src/ccgram/providers/{claude,codex,gemini,pi,omp,shell}.py` for provider behavior (Oh My Pi adds `ask` prompt-box detection in its own `parse_terminal_status`).
 - `src/ccgram/providers/pi_discovery.py` + `pi_format.py` for Pi command discovery + transcript parsing.
 - `src/ccgram/providers/codex_format.py` for interactive prompt text normalization.
 
@@ -31,7 +31,14 @@ Change picker-hint behavior (hint shown when a TUI picker slash command is forwa
 - `src/ccgram/providers/base.py` — `ProviderCapabilities.tui_picker_commands` frozenset.
 - `src/ccgram/handlers/commands/forward.py` — `_picker_hint()` introspects toolbar layout + picker set.
 - Per-provider sets: Claude (12), Codex (5), Gemini (12), Pi (6). Shell has none.
-- Drift guard: `tests/ccgram/providers/test_picker_capability_drift.py` asserts picker commands are a subset of each provider's builtin list.
+- Drift guard: `tests/ccgram/providers/test_picker_capability_drift.py` asserts picker commands are a subset of each provider's builtin list, and that the same holds for `tui_screen_commands` alongside disjointness from the picker set.
+
+Change terminal-only command replies (a command draws in the TUI and writes nothing to the transcript):
+
+- `src/ccgram/providers/base.py` — `ProviderCapabilities.tui_screen_commands` frozenset (bare lowercase names).
+- `src/ccgram/handlers/commands/screen_snapshot.py` — settle-poll pane capture + image reply.
+- `src/ccgram/handlers/commands/forward.py` — `_send_forward_post_probes()` branches to the screen reply before the status snapshot and the failure probe.
+- Verified against a live Oh My Pi TUI; adding a command requires driving the real CLI and confirming it writes nothing to the transcript.
 
 Change shell command generation:
 
@@ -48,6 +55,7 @@ Change Telegram interactive UX:
 - `src/ccgram/handlers/callback_data.py` for callback key contracts.
 - `src/ccgram/handlers/messaging_pipeline/message_queue.py` for ordering/merge.
 - `src/ccgram/handlers/live/live_view.py` for live view sessions.
+- Provider side: the transcript tool name must reach `INTERACTIVE_TOOL_NAMES` (alias it in the provider's format module, e.g. Oh My Pi `ask` → `AskUserQuestion`), and the provider's `parse_terminal_status` must return the pane box as `is_interactive=True`. See `providers/omp.py` (`extract_ask_panel`) and `providers/gemini.py` (`_extract_active_box`).
 
 Change command discovery / menu:
 
@@ -59,6 +67,7 @@ Change `/commands` failure probe / status snapshot:
 
 - `src/ccgram/handlers/commands/failure_probe.py` for transcript-based failure detection.
 - `src/ccgram/handlers/commands/status_snapshot.py` for status snapshot delegation.
+- `src/ccgram/handlers/commands/screen_snapshot.py` for the terminal-image reply to TUI-only commands.
 
 Change topic-creation flow (directory browser → worktree → workspace → provider → window):
 
@@ -168,6 +177,12 @@ Symptom: interactive keyboard not shown
 
 - Inspect `handlers/interactive/interactive_ui.py` + provider `parse_terminal_status` output.
 - Check hook path (`hook.py` → `handlers/hook_events.py`) for Claude.
+- Oh My Pi sends its tool_use through the `AskUserQuestion` alias (`providers/pi_format.py`), and the pane side must expose an "Ask" box with an `↑/↓ move · Esc cancel` footer (`providers/omp.py`). A prompt that answers in the TUI but not in Telegram means one of those two links broke.
+
+Symptom: a forwarded slash command replies with only the send acknowledgement
+
+- The provider wrote nothing to the transcript. Check whether the command draws in the TUI only (Oh My Pi `/context`, `/usage`, `/tools`); declare it in `ProviderCapabilities.tui_screen_commands` so `handlers/commands/screen_snapshot.py` replies with an image.
+- Oh My Pi text dumps and one-line toasts (`/changelog`, `/dirs`, `/dump`) stay unrelayed by design — use 📷 Screen or `/live` to read them.
 
 Symptom: duplicated or out-of-order status/content messages
 

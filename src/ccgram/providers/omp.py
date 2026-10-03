@@ -22,6 +22,7 @@ with no value opens an interactive picker ccgram cannot drive over
 
 from __future__ import annotations
 
+import re
 import tempfile
 from dataclasses import replace
 from pathlib import Path
@@ -29,6 +30,7 @@ from pathlib import Path
 from ccgram.providers.base import (
     DiscoveredCommand,
     SessionStartEvent,
+    StatusUpdate,
 )
 from ccgram.providers.omp_discovery import (
     _OMP_TELEGRAM_BUILTINS,
@@ -92,6 +94,86 @@ def encode_cwd_dirname(cwd: str) -> str:
     return "--" + str(resolved).strip("/").replace("/", "-") + "--"
 
 
+# ── Interactive ``ask`` prompt ───────────────────────────────────────────
+#
+# The ``ask`` tool draws its question as a box titled "Ask" and writes nothing
+# to the transcript while it waits, so that box is the only place the question
+# and its options appear.  Verified against a live omp 18.2.1 TUI:
+#
+#   ╭─ Ask ───────────────────────────────────────╮
+#   │ Which color do you prefer?                   │
+#   ├──────────────────────────────────────────────┤
+#   │   󱊔 󰄌 Red                                     │
+#   │       Warm and bold.                         │
+#   │     󰄌 Green                                   │
+#   ├──────────────────────────────────────────────┤
+#   │ Enter select · n note · ↑/↓ move · Esc cancel │
+#   ╰──────────────────────────────────────────────╯
+#
+# The footer differs per flavour — "Enter select" for single and tabbed asks,
+# "Space toggle · Enter next" for multi-select, with "Tab/←/→" added once the
+# ask has tabs — but the arrow/Esc hint is on all of them.  An answered ask
+# collapses to a box without a footer, so the hint is what proves the prompt
+# is still waiting.
+_ASK_BOX_TITLE_RE = re.compile(r"^\s*╭─+\s*Ask\b")
+_ASK_BOX_CLOSE_RE = re.compile(r"^\s*╰")
+_ASK_HINT_FRAGMENTS = ("↑/↓ move", "Esc cancel")
+
+# Nerd Font icons omp draws at the start of an option row, transliterated to
+# standard Unicode so Telegram renders the rows instead of private-use boxes.
+# Each replacement is one column wide, so the captured alignment survives.
+_ASK_ROW_ICONS = str.maketrans(
+    {
+        "\uf054": "❯",  # cursor on the highlighted row
+        "\uf10c": "○",  # radio button, not chosen
+        "\uf096": "☐",  # checkbox, not chosen
+        "\uf14a": "☑",  # checkbox, chosen
+    }
+)
+
+# A wide pane pads every box line to its full width. Dropping the trailing
+# right border and collapsing the long rules keeps the panel readable in a
+# Telegram message without losing a row of content.
+_ASK_TRAILING_BORDER_RE = re.compile(r"\s*│\s*$")
+_ASK_RULE_RE = re.compile(r"─{5,}")
+
+
+def _fit_ask_panel(box: str) -> str:
+    """Trim a captured box to its content width for display."""
+    lines = [
+        _ASK_RULE_RE.sub("─────", _ASK_TRAILING_BORDER_RE.sub("", line)).rstrip()
+        for line in box.split("\n")
+    ]
+    return "\n".join(lines)
+
+
+def extract_ask_panel(pane_text: str) -> str | None:
+    """Return the ``ask`` prompt box a pane is waiting on, else None.
+
+    Reads the last complete box of the capture. The box counts only when its
+    title is "Ask" and its footer carries the arrow/Esc hint, so a half-drawn
+    frame or a collapsed, already answered box never becomes a live prompt.
+    """
+    lines = pane_text.split("\n")
+    close_idx = next(
+        (i for i in range(len(lines) - 1, -1, -1) if _ASK_BOX_CLOSE_RE.match(lines[i])),
+        None,
+    )
+    if close_idx is None:
+        return None
+    open_idx = next(
+        (i for i in range(close_idx - 1, -1, -1) if _ASK_BOX_TITLE_RE.match(lines[i])),
+        None,
+    )
+    if open_idx is None:
+        return None
+
+    box = "\n".join(lines[open_idx : close_idx + 1])
+    if not all(fragment in box for fragment in _ASK_HINT_FRAGMENTS):
+        return None
+    return _fit_ask_panel(box.translate(_ASK_ROW_ICONS))
+
+
 class OmpProvider(PiProvider):
     """AgentProvider implementation for the Oh My Pi CLI."""
 
@@ -126,6 +208,14 @@ class OmpProvider(PiProvider):
                 "todo",
             }
         ),
+        # Commands omp draws as a full-screen view and never writes to the
+        # transcript, verified by driving a live omp 18.2.1 TUI. Forwarding one
+        # otherwise produced no reply at all, so ccgram answers with a captured
+        # terminal image. Text dumps (/changelog), one-line toasts (/dirs,
+        # /dump, /export) and the modal pickers above keep their existing path.
+        tui_screen_commands=frozenset(
+            {"context", "hotkeys", "jobs", "stats", "tools", "usage"}
+        ),
     )
 
     _BUILTINS = _OMP_TELEGRAM_BUILTINS
@@ -155,3 +245,26 @@ class OmpProvider(PiProvider):
 
     def discover_commands(self, base_dir: str) -> list[DiscoveredCommand]:
         return discover_omp_commands(base_dir)
+
+    # ── Terminal status ─────────────────────────────────────────────────
+
+    def parse_terminal_status(
+        self,
+        pane_text: str,
+        *,
+        pane_title: str = "",  # noqa: ARG002 — omp sets no title-derived status
+    ) -> StatusUpdate | None:
+        """Report a waiting ``ask`` prompt as an interactive UI.
+
+        omp draws no spinner or status line ccgram can read, so the only pane
+        state worth surfacing is the question box the user has to answer.
+        """
+        panel = extract_ask_panel(pane_text)
+        if panel is None:
+            return None
+        return StatusUpdate(
+            raw_text=panel,
+            display_label="Ask",
+            is_interactive=True,
+            ui_type="Ask",
+        )

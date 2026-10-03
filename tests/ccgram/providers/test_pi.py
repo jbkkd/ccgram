@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from ccgram.handlers.interactive.interactive_ui import INTERACTIVE_TOOL_NAMES
 from ccgram.providers.pi import (
     PiProvider,
     _candidate_transcripts,
@@ -53,11 +54,41 @@ class TestCanonicalToolName:
             ("edit", "Edit"),
             ("webfetch", "WebFetch"),
             ("web_fetch", "WebFetch"),
+            ("ask", "AskUserQuestion"),
             ("unknown_tool", "unknown_tool"),
         ],
     )
     def test_aliases(self, raw: str, display: str) -> None:
         assert canonical_tool_name(raw) == display
+
+    def test_ask_tool_use_routes_to_interactive_handling(self) -> None:
+        """omp's ``ask`` tool must surface the name the router reacts to."""
+        msg = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "toolCall",
+                    "id": "t1",
+                    "name": "ask",
+                    "arguments": {
+                        "i": "Clarifying scope",
+                        "questions": [
+                            {
+                                "id": "scope",
+                                "question": "How wide is the scope?",
+                                "options": [{"label": "Narrow"}, {"label": "Wide"}],
+                                "multi": False,
+                            }
+                        ],
+                    },
+                }
+            ],
+        }
+        msgs, _ = parse_assistant(msg, {})
+
+        assert msgs[0].tool_name == "AskUserQuestion"
+        assert msgs[0].tool_name in INTERACTIVE_TOOL_NAMES
+        assert "\u2753" in msgs[0].text
 
 
 class TestExtractText:

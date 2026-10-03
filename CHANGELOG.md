@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add Oh My Pi (omp) provider
 - Queue follow-up messages with each provider's own follow-up key
 - Detect Oh My Pi from the pane process and the Herdr agent list
+- Reply to Oh My Pi terminal-only commands with a captured screen image
+- Show Oh My Pi `ask` questions in Telegram with inline keyboard controls
+
+### Fixed
+
+- Re-send the agent launch command on Herdr when a new pane's shell prompt swallows its first key, so the agent still starts and topic creation succeeds
 
 ## [4.11.2] - 2026-09-14
 

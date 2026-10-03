@@ -10,7 +10,7 @@ CCGram supports multiple agent CLI backends. Each Telegram topic can use a diffe
 | Codex CLI   | `codex`     | Yes         | Yes    | Yes      | JSONL      | Hook Stop + pyte VT100 interactive UI + transcript activity heuristic |
 | Gemini CLI  | `gemini`    | Yes         | Yes    | Yes      | JSONL      | Hook AfterAgent + pane title + interactive UI + `/status` snapshot    |
 | Pi          | `pi`        | Yes         | Yes    | Yes      | JSONL (v3) | Hook-runner Stop + transcript activity heuristic                      |
-| Oh My Pi    | `omp`       | No          | Yes    | Yes      | JSONL (v3) | Transcript activity heuristic + herdr native agent status             |
+| Oh My Pi    | `omp`       | No          | Yes    | Yes      | JSONL (v3) | Transcript activity heuristic + `ask` prompt box + herdr native agent status |
 | Antigravity | `agy`       | No          | Yes    | Yes      | JSONL      | Transcript activity heuristic + `/status` snapshot                    |
 | Shell       | `bash`      | No          | No     | No       | None       | Shell prompt idle detection                                           |
 
@@ -235,8 +235,15 @@ Oh My Pi exposes a Telegram-safe command list built from its own command registr
 - **Prompt templates** — `.md` files under `~/.omp/agent/prompts/` or `<project>/.omp/prompts/`, invoked as the bare `/name`. Oh My Pi itself uses only the current directory, but ccgram walks the project ancestors up to the first `.git` ancestor, exactly as it does for Pi.
 - **Custom commands** — `.md` files under `~/.omp/agent/commands/` or `<project>/.omp/commands/`, also invoked as the bare `/name`. Pi has no equivalent directory, so this source is Oh My Pi only.
 - **Extension and hook commands** — TypeScript/JavaScript files (`.ts`, `.js`, `.mjs`, `.cjs`) under `~/.omp/agent/extensions/`, `~/.omp/agent/hooks/pre/`, `~/.omp/agent/hooks/post/`, or the matching `<project>/.omp/` directories, scanned for `pi.registerCommand("name", ...)` calls. Oh My Pi extension factories receive the same legacy `pi` object as Pi, so one scan covers both. The walker prunes `node_modules`, `dist`, `build`, `.git`, and every hidden directory before descent; both agents discover extensions with `hidden: false`.
+- **Terminal-only commands** — `/context`, `/hotkeys`, `/jobs`, `/stats`, `/tools`, and `/usage` draw a full-screen view and write nothing to the transcript. CCGram forwards them and answers with a captured terminal image, so the topic never ends with only the send acknowledgement.
 
 Names collide-dedupe with first-source wins (builtins > skills > prompts > commands > extensions and hooks).
+
+### Interactive Prompts
+
+Oh My Pi's `ask` tool draws its question as a box titled "Ask" and writes nothing to the transcript while it waits for an answer. CCGram detects that box in the pane and posts the question with its options as an interactive message: `↑`/`↓`/`Enter` answer a plain ask, `Space` toggles a multi-select answer, and `Tab`/`←`/`→` move between the tabs of a multi-question ask. The row icons are transliterated (`❯` cursor, `○`, `☐`, `☑`) and the box is fitted to its content width, so the prompt reads the same in Telegram as in the terminal. An answered ask collapses to a box without a footer, which is how CCGram knows the prompt is gone.
+
+Every ask offers an "Other (type your own)" row. Selecting it and then sending the text from the topic answers with that text; Oh My Pi records the result as custom input rather than a chosen option, and CCGram relays it as `User provided custom input: <text>`.
 
 ### Status Detection
 

@@ -470,3 +470,129 @@ class TestDiscoverCommands:
         assert [c.name for c in cmds].count("beta") == 1
         assert by_name["beta"].source == "command"
         assert by_name["beta"].description == "Prompt beta"
+
+
+# Fixtures follow real omp 18.2.1 captures: box titles, separators, row icons
+# (U+F054 cursor, U+F10C radio, U+F096 checkbox, U+F14A checked box), the
+# right border a wide pane pads every row with, and the footer hints are
+# verbatim; only the decorative status-bar glyphs and the exact pane width
+# are shortened.
+_ASK_SINGLE = """\
+  Asking preferred color
+╭─ Ask ────────────────────────────────────────────────────────╮
+│ Which color do you prefer?                                   │
+├──────────────────────────────────────────────────────────────┤
+│ \uf054 \uf10c Red                                             │
+│       Warm and bold.                                         │
+│   \uf10c Green                                                │
+│       Calm and natural.                                      │
+│   \uf10c Blue                                                 │
+│       Cool and steady.                                       │
+│   \uf10c Other (type your own)                                │
+├──────────────────────────────────────────────────────────────┤
+│ Enter select · n note · ↑/↓ move · Esc cancel                │
+╰──────────────────────────────────────────────────────────────╯
+ DeepSeek V4.1 Flash · low · ompask
+❯
+"""
+
+_ASK_TABBED_MULTI = """\
+  Asking scope and speed
+╭─ Ask ────────────────────────────────────────────────────────╮
+│  Scope    Speed    Submit                                    │
+│ Which speed?                                                 │
+├──────────────────────────────────────────────────────────────┤
+│ \uf054 \uf14a Fast                                            │
+│       Ship quickly with light checks.                        │
+│   \uf096 Careful                                              │
+│       Check each step, even if slower.                       │
+│   \uf096 Other (type your own)                                │
+│                                                              │
+├──────────────────────────────────────────────────────────────┤
+│ Space toggle · Enter next · ↑/↓ move · Tab/←/→ · Esc cancel  │
+╰──────────────────────────────────────────────────────────────╯
+ DeepSeek V4.1 Flash · low · ompask
+❯
+"""
+
+# An answered ask collapses to a box with neither options nor footer.
+_ASK_ANSWERED = """\
+╭─── Ask ────────────────────────────────────────────────────────
+│  Which color do you prefer?
+│  Red
+│  Green
+│  Blue
+╰────────────────────────────────────────────────────────────────
+ Asked. You picked Green.
+❯
+"""
+
+# Only the "Ask · running" header made it into the capture (torn frame).
+_ASK_TORN_FRAME = """\
+╭─ Ask · running 20s
+╰
+  Asking preferred color
+❯
+"""
+
+
+class TestAskPrompt:
+    def test_single_select_prompt_is_interactive(self) -> None:
+        status = OmpProvider().parse_terminal_status(_ASK_SINGLE)
+
+        assert status is not None
+        assert status.is_interactive is True
+        assert status.ui_type == "Ask"
+        assert "Which color do you prefer?" in status.raw_text
+        for label in ("Red", "Green", "Blue", "Other (type your own)"):
+            assert label in status.raw_text
+        assert "↑/↓ move · Esc cancel" in status.raw_text
+
+    def test_option_rows_render_without_private_use_icons(self) -> None:
+        status = OmpProvider().parse_terminal_status(_ASK_SINGLE)
+
+        assert status is not None
+        assert "│ ❯ ○ Red" in status.raw_text
+        assert "│   ○ Green" in status.raw_text
+        assert "\uf054" not in status.raw_text
+        assert "\uf10c" not in status.raw_text
+
+    def test_padded_rows_are_fitted_for_display(self) -> None:
+        status = OmpProvider().parse_terminal_status(_ASK_SINGLE)
+
+        assert status is not None
+        lines = status.raw_text.splitlines()
+        assert lines[0] == "╭─ Ask ─────╮"
+        assert lines[1] == "│ Which color do you prefer?"
+        assert lines[2] == "├─────┤"
+        assert lines[3] == "│ ❯ ○ Red"
+        assert lines[4] == "│       Warm and bold."
+        assert all(line == line.rstrip() for line in lines)
+
+    def test_multi_select_prompt_is_interactive(self) -> None:
+        status = OmpProvider().parse_terminal_status(_ASK_TABBED_MULTI)
+
+        assert status is not None
+        assert status.is_interactive is True
+        assert "Which speed?" in status.raw_text
+        assert "☑ Fast" in status.raw_text
+        assert "☐ Careful" in status.raw_text
+        assert "Space toggle · Enter next" in status.raw_text
+
+    def test_answered_box_is_not_interactive(self) -> None:
+        assert OmpProvider().parse_terminal_status(_ASK_ANSWERED) is None
+
+    def test_torn_frame_is_not_interactive(self) -> None:
+        assert OmpProvider().parse_terminal_status(_ASK_TORN_FRAME) is None
+
+    def test_other_box_is_not_interactive(self) -> None:
+        pane = """\
+╭─ Context ──────────────────────────────────────────────────────
+│ 120K/1m tokens (11.5%)
+╰────────────────────────────────────────────────────────────────
+❯
+"""
+        assert OmpProvider().parse_terminal_status(pane) is None
+
+    def test_pane_without_box_returns_none(self) -> None:
+        assert OmpProvider().parse_terminal_status("❯ hello\n  ompask\n") is None

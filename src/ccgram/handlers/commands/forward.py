@@ -11,7 +11,9 @@ Pipeline:
   3. capture transcript + pane probe context
   4. send via tmux — any /<token> is forwarded as-is; unknown commands
      are surfaced reactively by the failure probe, not pre-rejected
-  5. spawn the failure probe + status snapshot fallbacks
+  5. spawn the post-send reply: a terminal screen image for a provider
+     command that only draws in the TUI, a status snapshot for
+     /status-like commands, otherwise the failure probe
   6. handle provider session-reset post-send cleanup (clear session, reset
      polling) — see ``_SESSION_RESET_COMMANDS`` for which commands count
      per provider
@@ -52,6 +54,7 @@ from .menu_sync import (
     _build_provider_command_metadata,
     sync_scoped_provider_menu,
 )
+from .screen_snapshot import _spawn_screen_snapshot
 from .status_snapshot import (
     _maybe_send_status_snapshot,
     _status_snapshot_probe_offset,
@@ -221,8 +224,11 @@ async def _capture_forward_probe_context(
     provider,
     cc_slash: str,
     status_like: bool,
+    screen_like: bool,
 ) -> tuple[str | None, int | None, str | None, int | None]:
-    """Capture pre-send probe context, skipping /status-like commands."""
+    """Capture pre-send probe context, skipping /status-like and screen commands."""
+    if screen_like:
+        return None, None, None, None
     if status_like:
         return None, None, None, _status_snapshot_probe_offset(window_id, cc_slash)
     (
@@ -240,12 +246,22 @@ async def _send_forward_post_probes(
     cc_slash: str,
     provider,
     status_like: bool,
+    screen_like: bool,
     status_probe_offset: int | None,
     probe_transcript_path: str | None,
     probe_transcript_offset: int | None,
     probe_pane_before: str | None,
 ) -> None:
-    """Send post-forward status/failure probes with one status-only fast path."""
+    """Send the post-forward reply: screen image, status snapshot, or error probe."""
+    if screen_like:
+        _spawn_screen_snapshot(
+            PTBTelegramClient(message.get_bot()),
+            message,
+            window_id,
+            display,
+            cc_slash,
+        )
+        return
     await _maybe_send_status_snapshot(
         message,
         window_id,
@@ -312,6 +328,7 @@ async def forward_command_handler(
     args = _default_command_args(cc_name, args, display)
     cc_slash = f"/{cc_name} {args}".rstrip() if args else f"/{cc_name}"
     status_like = cc_name.lower() in {"status", "stats"}
+    screen_like = cc_name.lower() in provider.capabilities.tui_screen_commands
 
     if provider.capabilities.followup_key and cc_name.lower() == _FOLLOWUP_COMMAND:
         await _handle_followup_command(
@@ -340,7 +357,9 @@ async def forward_command_handler(
         probe_transcript_offset,
         probe_pane_before,
         status_probe_offset,
-    ) = await _capture_forward_probe_context(window_id, provider, cc_slash, status_like)
+    ) = await _capture_forward_probe_context(
+        window_id, provider, cc_slash, status_like, screen_like
+    )
 
     lifecycle_strategy.clear_probe_failures(window_id)
     success, error_msg = await send_telegram_to_window(
@@ -367,6 +386,7 @@ async def forward_command_handler(
         cc_slash,
         provider,
         status_like,
+        screen_like,
         status_probe_offset,
         probe_transcript_path,
         probe_transcript_offset,

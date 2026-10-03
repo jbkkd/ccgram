@@ -405,6 +405,8 @@ Readiness is checked with public `ping`. Unknown future protocol numbers warn bu
 
 Hooks that invoke a bare `ccgram` use the executable on the agent's `PATH`, even when the bot runs from a development checkout. Upgrade that installation too (`uv tool upgrade ccgram` for a uv tool install). An old hook executable can create no session mapping while the newer bot still shows terminal status, leaving a topic without transcript messages. To bind Codex hooks to the checkout's interpreter instead, run `uv run ccgram hook --install --provider codex` from the checkout.
 
+Reinstall a checkout into the tool environment with `uv tool install --force --no-cache <checkout path>`. A plain `--force` reuses uv's cached build of that path, so uncommitted edits never reach the installed copy and the running bot answers with the old behaviour. Check the installed copy before restarting: `ls ~/.local/share/uv/tools/ccgram/lib/python3.14/site-packages/ccgram/`.
+
 ### Differences from tmux
 
 herdr advertises its own capabilities through the seam; the behavioral consequences a user sees:
@@ -424,7 +426,7 @@ herdr advertises its own capabilities through the seam; the behavioral consequen
 
 Creating sessions from the terminal on herdr is covered in [Creating Sessions from the Terminal](#creating-sessions-from-the-terminal).
 
-> **Workspace picker:** On herdr, `/new` shows an extra step after directory selection. Choose a workspace to pin the new tab there, or skip it: ccgram then explicitly creates a workspace from the requested directory and uses only its returned ID. It never infers the active or a matching workspace.
+> **Workspace picker:** On herdr, `/new` shows an extra step after directory selection. Choose a workspace to pin the new tab there, or skip it: ccgram then explicitly creates a workspace from the requested directory and uses only its returned ID. It never infers the active or a matching workspace. CCGram re-sends the launch command while the new pane is still a bare shell, because a shell that is still running its rc scripts can swallow the first key. A pane that never runs the command is reported as a failed launch instead of waiting for a session that cannot arrive.
 >
 > **Self-hosting escape hatch:** Workspaces or tabs whose label matches `__*__` (e.g. `__main__`) are invisible to ccgram. Use this naming convention to run ccgram itself inside herdr without it auto-adopting its own terminal as a topic.
 
@@ -654,6 +656,14 @@ Action names must be ≤24 chars (callback_data budget). Providers absent from t
 ### Picker Hints
 
 When you forward a slash command that opens a modal in-TUI picker (e.g. Claude `/model`, `/login`, `/theme`; Codex/Gemini `/model`; Pi/Oh My Pi `/model`), the topic reply adds a hint pointing at `/toolbar` to drive the picker with arrow keys. The hint adapts to your toolbar — if you removed Up/Down/Enter/Esc keys, the hint degrades to "Open /toolbar to drive the picker."
+
+### Terminal-Only Commands
+
+Some commands only draw inside the terminal and write nothing to the session
+transcript. Oh My Pi does this for `/context`, `/hotkeys`, `/jobs`, `/stats`,
+`/tools`, and `/usage`. A forwarded one replies with an image of the terminal
+screen, captured after the screen stops changing. Scroll wide screens with the
+toolbar keys.
 
 ## Git Worktree Topics
 
